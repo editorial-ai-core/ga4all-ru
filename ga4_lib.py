@@ -1,3 +1,6 @@
+# ga4_lib.py
+# GA4 helper library for Streamlit apps (Service Account + GA4 Data API)
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,7 +15,6 @@ from google.analytics.data_v1beta.types import (
     Dimension,
     Filter,
     FilterExpression,
-    InListFilter,
     Metric,
     OrderBy,
     RunReportRequest,
@@ -165,10 +167,20 @@ def _chunks(seq: Sequence[str], size: int) -> Iterable[List[str]]:
 
 
 def _inlist_expr(field_name: str, values: Sequence[str]) -> FilterExpression:
+    """
+    InListFilter type differs across google-analytics-data versions:
+    - sometimes it's exposed as Filter.InListFilter only (no top-level InListFilter import).
+    - case_sensitive may or may not be supported.
+    """
+    try:
+        in_list = Filter.InListFilter(values=list(values), case_sensitive=False)
+    except TypeError:
+        in_list = Filter.InListFilter(values=list(values))
+
     return FilterExpression(
         filter=Filter(
             field_name=field_name,
-            in_list_filter=InListFilter(values=list(values), case_sensitive=False),
+            in_list_filter=in_list,
         )
     )
 
@@ -278,20 +290,24 @@ def fetch_ga4_by_paths(
         out = pd.concat(frames, ignore_index=True)
 
     if not out.empty:
-        # Weighted average for averageSessionDuration by sessions (safe even if duplicates appear)
+        # Weighted average for averageSessionDuration by sessions (safe even if duplicates happen)
         out["_asd_x_sess"] = (out["averageSessionDuration"] * out["sessions"]).fillna(0)
 
+        # If duplicates happen (should be rare), this aggregation is sane:
+        # - sum additive metrics
+        # - activeUsers is not additive; max is safer than sum
         agg = {
             "screenPageViews": "sum",
             "sessions": "sum",
             "engagedSessions": "sum",
-            "activeUsers": "max",      # safer than sum if duplicates happen
+            "activeUsers": "max",
             "_asd_x_sess": "sum",
         }
         out = out.groupby("pagePath", as_index=False).agg(agg)
 
-        out["avgSessionDuration_sec"] = out["_asd_x_sess"].where(out["sessions"] > 0, 0) / out["sessions"].where(out["sessions"] > 0, 1)
-        out["engagementRate"] = out["engagedSessions"].where(out["sessions"] > 0, 0) / out["sessions"].where(out["sessions"] > 0, 1)
+        denom_sessions = out["sessions"].where(out["sessions"] > 0, 1)
+        out["avgSessionDuration_sec"] = (out["_asd_x_sess"] / denom_sessions).fillna(0)
+        out["engagementRate"] = (out["engagedSessions"] / denom_sessions).fillna(0)
 
         out = out.drop(columns=["_asd_x_sess"])
 
@@ -351,7 +367,8 @@ def fetch_top_materials(
         df["avgSessionDuration_sec"] = pd.Series(dtype="float64")
     else:
         df["avgSessionDuration_sec"] = df["averageSessionDuration"].fillna(0)
-        df["engagementRate"] = (df["engagedSessions"].where(df["sessions"] > 0, 0) / df["sessions"].where(df["sessions"] > 0, 1)).fillna(0)
+        denom_sessions = df["sessions"].where(df["sessions"] > 0, 1)
+        df["engagementRate"] = (df["engagedSessions"] / denom_sessions).fillna(0)
 
     df = df.rename(columns={"screenPageViews": "views"})
 

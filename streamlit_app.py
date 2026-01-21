@@ -1,4 +1,3 @@
-# streamlit_app.py
 import base64
 from datetime import date, timedelta
 from pathlib import Path
@@ -7,7 +6,7 @@ import streamlit as st
 import pandas as pd
 
 from ga4_lib import (
-    build_config_from_secrets,
+    build_config_from_streamlit_secrets,
     make_client,
     collect_paths_hosts,
     fetch_ga4_by_paths,
@@ -27,8 +26,7 @@ def fail_ui(msg: str):
     st.stop()
 
 
-def analytics_icon_svg_uri() -> str:
-    # Inline GA-like icon (no extra assets needed)
+def _analytics_icon_svg_uri() -> str:
     svg = """
     <svg width="84" height="84" viewBox="0 0 84 84" fill="none" xmlns="http://www.w3.org/2000/svg">
       <rect x="8" y="48" width="14" height="28" rx="7" fill="#F9AB00"/>
@@ -46,9 +44,9 @@ def render_header():
         """
         <style>
           .ac-header { margin-top: 8px; margin-bottom: 6px; }
-          .ac-title { font-size: 48px; font-weight: 800; line-height: 1.05; margin: 0; }
+          .ac-title { font-size: 52px; font-weight: 800; line-height: 1.05; margin: 0; }
           .ac-sub { font-size: 16px; color: rgba(0,0,0,0.65); margin-top: 10px; }
-          .ac-hr { border: none; border-top: 1px solid rgba(0,0,0,0.08); margin: 16px 0 10px; }
+          .ac-hr { border: none; border-top: 1px solid rgba(0,0,0,0.10); margin: 16px 0 8px; }
           .ac-icon { display:flex; justify-content:flex-end; align-items:center; }
         </style>
         """,
@@ -70,7 +68,7 @@ def render_header():
         st.markdown(
             f"""
             <div class="ac-icon">
-              <img src="{analytics_icon_svg_uri()}" width="84" height="84" />
+              <img src="{_analytics_icon_svg_uri()}" width="84" height="84" />
             </div>
             """,
             unsafe_allow_html=True,
@@ -82,7 +80,7 @@ def render_header():
 @st.cache_resource
 def get_client_and_pid():
     try:
-        cfg = build_config_from_secrets(st.secrets)
+        cfg = build_config_from_streamlit_secrets(st.secrets)
     except GA4ConfigError as e:
         fail_ui(str(e))
     client = make_client(cfg)
@@ -91,10 +89,8 @@ def get_client_and_pid():
 
 client, pid_default = get_client_and_pid()
 
-# Header (top)
 render_header()
 
-# Sidebar (period + property + branding)
 with st.sidebar:
     st.markdown("### Период отчета")
     today = date.today()
@@ -108,13 +104,14 @@ with st.sidebar:
     st.markdown("### Developed by")
     st.markdown("**Alexey Terekhov**")
     st.markdown("[aterekhov@internews.org](mailto:aterekhov@internews.org)")
-
     if INTERNEWS_LOGO.exists():
         st.image(str(INTERNEWS_LOGO), width=180)
 
-# Main tabs
 tab1, tab2, tab3 = st.tabs(["URL Analytics", "Топ материалов", "Общие данные по сайту"])
 
+# --------------------------
+# Tab 1: URL Analytics
+# --------------------------
 with tab1:
     st.subheader("URL Analytics")
     uinput = st.text_area("Вставьте URL или пути (по одному в строке)", height=200)
@@ -130,7 +127,7 @@ with tab1:
 
         unique_paths, hostnames, order_paths = collect_paths_hosts(lines)
 
-        df_p = fetch_ga4_by_paths(
+        df = fetch_ga4_by_paths(
             client=client,
             property_id=property_id,
             paths_in=unique_paths,
@@ -140,25 +137,22 @@ with tab1:
             order_keys=order_paths,
         )
 
-        show = df_p.reindex(
-            columns=[
-                "pagePath",
-                "pageTitle",
-                "screenPageViews",
-                "activeUsers",
-                "viewsPerActiveUser",
-                "avgEngagementTime_sec",
-            ]
-        ).rename(
-            columns={
-                "pagePath": "Путь",
-                "pageTitle": "Заголовок",
-                "screenPageViews": "Просмотры",
-                "activeUsers": "Уникальные пользователи",
-                "viewsPerActiveUser": "Просмотры / пользователь",
-                "avgEngagementTime_sec": "Average engagement time (сек)",
-            }
-        )
+        # Русские названия + нужный набор метрик
+        show = df.reindex(columns=[
+            "pagePath",
+            "views",
+            "activeUsers",
+            "sessions",
+            "engagementRate",
+            "avgSessionDuration_sec",
+        ]).rename(columns={
+            "pagePath": "Путь",
+            "views": "Просмотры",
+            "activeUsers": "Активные пользователи",
+            "sessions": "Сессии",
+            "engagementRate": "Доля вовлечённых сессий",
+            "avgSessionDuration_sec": "Средняя длительность сеанса",
+        })
 
         st.dataframe(show, use_container_width=True, hide_index=True)
         st.download_button(
@@ -168,6 +162,9 @@ with tab1:
             "text/csv",
         )
 
+# --------------------------
+# Tab 2: Top materials
+# --------------------------
 with tab2:
     st.subheader("Топ материалов")
     limit = st.number_input("Лимит", min_value=1, max_value=500, value=10)
@@ -185,8 +182,34 @@ with tab2:
             end_date=str(date_to),
             limit=int(limit),
         )
-        st.dataframe(df_top, use_container_width=True, hide_index=True)
 
+        show_top = df_top.reindex(columns=[
+            "pagePath",
+            "views",
+            "activeUsers",
+            "sessions",
+            "engagementRate",
+            "avgSessionDuration_sec",
+        ]).rename(columns={
+            "pagePath": "Путь",
+            "views": "Просмотры",
+            "activeUsers": "Активные пользователи",
+            "sessions": "Сессии",
+            "engagementRate": "Доля вовлечённых сессий",
+            "avgSessionDuration_sec": "Средняя длительность сеанса",
+        })
+
+        st.dataframe(show_top, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Скачать CSV",
+            show_top.to_csv(index=False).encode("utf-8"),
+            "ga4_top_materials.csv",
+            "text/csv",
+        )
+
+# --------------------------
+# Tab 3: Site totals
+# --------------------------
 with tab3:
     st.subheader("Общие данные по сайту")
 
@@ -203,7 +226,9 @@ with tab3:
             end_date=str(date_to),
         )
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Sessions", f"{int(totals['sessions']):,}")
-        c2.metric("Unique Users", f"{int(totals['totalUsers']):,}")
-        c3.metric("Page Views", f"{int(totals['screenPageViews']):,}")
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric("Page Views", f"{int(totals['views']):,}")
+        c2.metric("Sessions", f"{int(totals['sessions']):,}")
+        c3.metric("Unique Users", f"{int(totals['totalUsers']):,}")
+        c4.metric("Active users", f"{int(totals['activeUsers']):,}")

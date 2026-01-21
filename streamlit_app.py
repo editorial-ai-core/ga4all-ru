@@ -1,4 +1,3 @@
-# streamlit_app.py
 import base64
 from datetime import date, timedelta
 from pathlib import Path

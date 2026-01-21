@@ -1,12 +1,13 @@
 # streamlit_app.py
-import streamlit as st
-import pandas as pd
+import base64
 from datetime import date, timedelta
 from pathlib import Path
-import base64
+
+import streamlit as st
+import pandas as pd
 
 from ga4_lib import (
-    build_config_from_streamlit_secrets,
+    build_config_from_secrets,
     make_client,
     collect_paths_hosts,
     fetch_ga4_by_paths,
@@ -17,10 +18,6 @@ from ga4_lib import (
 
 st.set_page_config(page_title="Analytics Console", layout="wide")
 
-
-# -------------------------
-# Helpers
-# -------------------------
 ASSETS_DIR = Path(__file__).parent / "assets"
 INTERNEWS_LOGO = ASSETS_DIR / "internews.svg"
 
@@ -30,14 +27,8 @@ def fail_ui(msg: str):
     st.stop()
 
 
-def svg_data_uri(svg_path: Path) -> str:
-    svg_bytes = svg_path.read_bytes()
-    b64 = base64.b64encode(svg_bytes).decode("utf-8")
-    return f"data:image/svg+xml;base64,{b64}"
-
-
 def analytics_icon_svg_uri() -> str:
-    # Простой “GA-like” значок (оранжевые бары) как inline-SVG
+    # Inline GA-like icon (no extra assets needed)
     svg = """
     <svg width="84" height="84" viewBox="0 0 84 84" fill="none" xmlns="http://www.w3.org/2000/svg">
       <rect x="8" y="48" width="14" height="28" rx="7" fill="#F9AB00"/>
@@ -88,34 +79,10 @@ def render_header():
     st.markdown('<hr class="ac-hr" />', unsafe_allow_html=True)
 
 
-def render_sidebar_branding(default_pid: str):
-    with st.sidebar:
-        st.markdown("### Период отчета")
-        today = date.today()
-        date_from = st.date_input("Дата с", value=today - timedelta(days=30), key="date_from")
-        date_to = st.date_input("Дата по", value=today, key="date_to")
-
-        st.divider()
-        property_id = st.text_input("GA4 Property ID", value=default_pid, key="property_id").strip()
-
-        st.divider()
-        st.markdown("### Developed by")
-        st.markdown("**Alexey Terekhov**")
-        st.markdown("[aterekhov@internews.org](mailto:aterekhov@internews.org)")
-
-        if INTERNEWS_LOGO.exists():
-            st.image(str(INTERNEWS_LOGO), width=170)
-
-    return date_from, date_to, property_id
-
-
-# -------------------------
-# Client init
-# -------------------------
 @st.cache_resource
 def get_client_and_pid():
     try:
-        cfg = build_config_from_streamlit_secrets(st.secrets)
+        cfg = build_config_from_secrets(st.secrets)
     except GA4ConfigError as e:
         fail_ui(str(e))
     client = make_client(cfg)
@@ -124,24 +91,36 @@ def get_client_and_pid():
 
 client, pid_default = get_client_and_pid()
 
-# -------------------------
-# UI
-# -------------------------
+# Header (top)
 render_header()
-date_from, date_to, property_id = render_sidebar_branding(pid_default)
 
+# Sidebar (period + property + branding)
+with st.sidebar:
+    st.markdown("### Период отчета")
+    today = date.today()
+    date_from = st.date_input("Дата с", value=today - timedelta(days=30))
+    date_to = st.date_input("Дата по", value=today)
+
+    st.divider()
+    property_id = st.text_input("GA4 Property ID", value=pid_default).strip()
+
+    st.divider()
+    st.markdown("### Developed by")
+    st.markdown("**Alexey Terekhov**")
+    st.markdown("[aterekhov@internews.org](mailto:aterekhov@internews.org)")
+
+    if INTERNEWS_LOGO.exists():
+        st.image(str(INTERNEWS_LOGO), width=180)
+
+# Main tabs
 tab1, tab2, tab3 = st.tabs(["URL Analytics", "Топ материалов", "Общие данные по сайту"])
 
-
-# -------------------------
-# Tab 1
-# -------------------------
 with tab1:
     st.subheader("URL Analytics")
     uinput = st.text_area("Вставьте URL или пути (по одному в строке)", height=200)
     lines = [x.strip() for x in (uinput or "").splitlines() if x.strip()]
 
-    if st.button("Собрать", key="btn_collect_urls"):
+    if st.button("Собрать"):
         if date_from > date_to:
             fail_ui("Дата «с» должна быть раньше или равна дате «по».")
         if not property_id:
@@ -189,15 +168,11 @@ with tab1:
             "text/csv",
         )
 
-
-# -------------------------
-# Tab 2
-# -------------------------
 with tab2:
     st.subheader("Топ материалов")
     limit = st.number_input("Лимит", min_value=1, max_value=500, value=10)
 
-    if st.button("Собрать топ", key="btn_collect_top"):
+    if st.button("Собрать топ"):
         if date_from > date_to:
             fail_ui("Дата «с» должна быть раньше или равна дате «по».")
         if not property_id:
@@ -212,28 +187,23 @@ with tab2:
         )
         st.dataframe(df_top, use_container_width=True, hide_index=True)
 
-
-# -------------------------
-# Tab 3
-# -------------------------
 with tab3:
     st.subheader("Общие данные по сайту")
 
-    if st.button("Обновить итоги", key="btn_collect_totals"):
+    if st.button("Обновить итоги"):
         if date_from > date_to:
             fail_ui("Дата «с» должна быть раньше или равна дате «по».")
         if not property_id:
             fail_ui("GA4 Property ID пуст.")
 
-        totals_df = fetch_site_totals(
+        totals = fetch_site_totals(
             client=client,
             property_id=property_id,
             start_date=str(date_from),
             end_date=str(date_to),
         )
-        totals = totals_df.iloc[0].to_dict()
 
         c1, c2, c3 = st.columns(3)
-        c1.metric("Sessions", f"{int(totals.get('sessions', 0)):,}")
-        c2.metric("Unique Users", f"{int(totals.get('totalUsers', 0)):,}")
-        c3.metric("Page Views", f"{int(totals.get('screenPageViews', 0)):,}")
+        c1.metric("Sessions", f"{int(totals['sessions']):,}")
+        c2.metric("Unique Users", f"{int(totals['totalUsers']):,}")
+        c3.metric("Page Views", f"{int(totals['screenPageViews']):,}")

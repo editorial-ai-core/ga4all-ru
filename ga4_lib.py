@@ -1,16 +1,8 @@
-# -*- coding: utf-8 -*-
-"""
-ga4_lib.py — reusable GA4 helpers (NO Streamlit dependency)
-
-Ключевая фишка для Streamlit Cloud:
-- все google-импорты сделаны "ленивыми" (внутри функций),
-  чтобы приложение не падало на старте из-за зависимости.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
+from collections.abc import Mapping
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import numpy as np
@@ -40,7 +32,7 @@ def build_config_from_secrets(secrets: Any) -> GA4Config:
     secrets: Mapping-like (например, streamlit.secrets)
     Требует:
       GA4_PROPERTY_ID
-      gcp_service_account (dict)
+      gcp_service_account (table/mapping)
     """
     getter = getattr(secrets, "get", None)
     if not callable(getter):
@@ -51,8 +43,10 @@ def build_config_from_secrets(secrets: Any) -> GA4Config:
         raise GA4ConfigError("Missing secret: GA4_PROPERTY_ID")
 
     sa = getter("gcp_service_account", None)
-    if not sa or not isinstance(sa, dict):
-        raise GA4ConfigError("Missing secret: gcp_service_account (dict)")
+
+    # Streamlit возвращает table как AttrDict/Mapping, не как dict
+    if sa is None or not isinstance(sa, Mapping):
+        raise GA4ConfigError("Missing secret: gcp_service_account (table/mapping)")
 
     return GA4Config(property_id=pid, service_account_info=dict(sa))
 

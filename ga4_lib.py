@@ -1,6 +1,3 @@
-# ga4_lib.py
-# GA4 helper library for Streamlit apps (Service Account + GA4 Data API)
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -38,20 +35,8 @@ class GA4Config:
     scopes: Tuple[str, ...] = ("https://www.googleapis.com/auth/analytics.readonly",)
 
 
-def _require_key(d: Any, key: str, expected_type: type, hint: str = "") -> Any:
-    if not isinstance(d, dict) or key not in d:
-        raise GA4ConfigError(f"Missing secret: {key} ({expected_type.__name__})")
-    v = d.get(key)
-    if not isinstance(v, expected_type):
-        raise GA4ConfigError(f"Bad secret type: {key} must be {expected_type.__name__}")
-    if hint:
-        # hint is not shown by default, only useful during debugging
-        pass
-    return v
-
-
 def build_config_from_streamlit_secrets(secrets: Any) -> GA4Config:
-    """
+    '''
     Expected Streamlit secrets keys:
 
     GA4_PROPERTY_ID = "123456789"
@@ -66,14 +51,13 @@ def build_config_from_streamlit_secrets(secrets: Any) -> GA4Config:
     token_uri="https://oauth2.googleapis.com/token"
 
     Notes:
-    - st.secrets behaves like a dict-like object. We only rely on dict operations.
-    - private_key can be multi-line (preferred) OR contain \n escapes.
-    """
+    - st.secrets behaves like a dict-like object.
+    - private_key can be multi-line (preferred) OR contain \\n escapes.
+    '''
     # secrets may be a special Streamlit object; convert shallowly via dict()
     try:
         root = dict(secrets)
     except Exception:
-        # last resort: assume it's already dict-like
         root = secrets  # type: ignore
 
     # property id
@@ -87,7 +71,6 @@ def build_config_from_streamlit_secrets(secrets: Any) -> GA4Config:
     if sa is None:
         raise GA4ConfigError("Missing secret: gcp_service_account (dict)")
     if not isinstance(sa, dict):
-        # sometimes Streamlit keeps nested objects; try converting
         try:
             sa = dict(sa)
         except Exception:
@@ -96,11 +79,10 @@ def build_config_from_streamlit_secrets(secrets: Any) -> GA4Config:
     # normalize private_key (allow either real multiline or \n escapes)
     pk = sa.get("private_key")
     if isinstance(pk, str):
-        # If user pasted with "\n" escapes, convert to real newlines
         if "\\n" in pk and "-----BEGIN PRIVATE KEY-----" in pk:
             sa["private_key"] = pk.replace("\\n", "\n")
 
-    # minimal fields validation (don't be too strict)
+    # minimal fields validation
     for k in ("type", "client_email", "token_uri", "private_key"):
         if k not in sa or not isinstance(sa.get(k), str) or not str(sa.get(k)).strip():
             raise GA4ConfigError(f"Missing secret inside [gcp_service_account]: {k} (str)")
@@ -141,20 +123,19 @@ def collect_paths_hosts(lines: Sequence[str]) -> Tuple[List[str], List[str], Lis
 
         if s.startswith("http://") or s.startswith("https://"):
             u = urlparse(s)
-            if u.netloc:
-                hosts.append(u.netloc.lower())
+            h = (u.hostname or "").strip()
+            if h:
+                hosts.append(h.lower())
             p = u.path or "/"
             if not p.startswith("/"):
                 p = "/" + p
             paths.append(p)
         else:
-            # treat as path
             p2 = s
             if not p2.startswith("/"):
                 p2 = "/" + p2
             paths.append(p2)
 
-    # unique while preserving order
     def uniq(seq: List[str]) -> List[str]:
         seen = set()
         out: List[str] = []
@@ -164,7 +145,7 @@ def collect_paths_hosts(lines: Sequence[str]) -> Tuple[List[str], List[str], Lis
                 out.append(x)
         return out
 
-    order_paths = paths[:]  # keep original ordering
+    order_paths = paths[:]  # keep original ordering (can include duplicates)
     return uniq(paths), uniq(hosts), order_paths
 
 
@@ -192,7 +173,7 @@ def _inlist_expr(field_name: str, values: Sequence[str]) -> FilterExpression:
     )
 
 
-def _and_expr(parts: List[FilterExpression]) -> Optional[FilterExpression]:
+def _and_expr(parts: List[Optional[FilterExpression]]) -> Optional[FilterExpression]:
     parts2 = [p for p in parts if p is not None]
     if not parts2:
         return None
@@ -213,7 +194,7 @@ def _run_report(
     order_bys: Optional[List[OrderBy]] = None,
 ) -> pd.DataFrame:
     req = RunReportRequest(
-        property="properties/%s" % property_id,
+        property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
         dimensions=[Dimension(name=d) for d in dimensions],
         metrics=[Metric(name=m) for m in metrics],
@@ -228,7 +209,6 @@ def _run_report(
 
     cols = list(dimensions) + list(metrics)
     rows: List[List[Any]] = []
-
     for r in resp.rows:
         dvals = [dv.value for dv in r.dimension_values]
         mvals = [mv.value for mv in r.metric_values]
@@ -236,7 +216,6 @@ def _run_report(
 
     df = pd.DataFrame(rows, columns=cols)
 
-    # coerce numeric metrics
     for m in metrics:
         if m in df.columns:
             df[m] = pd.to_numeric(df[m], errors="coerce")
@@ -245,7 +224,7 @@ def _run_report(
 
 
 # ---------------------------
-# Public API
+# Public API (contract aligned with streamlit_app.py)
 # ---------------------------
 
 def fetch_ga4_by_paths(
@@ -258,30 +237,28 @@ def fetch_ga4_by_paths(
     order_keys: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     """
-    Returns per-page table for given paths (+ optional hostName filter).
-    Metrics:
-      - screenPageViews  (Views)
-      - activeUsers      (Active users)
-      - sessions         (Sessions)
-      - engagementRate   (Engaged sessions / Sessions)
-      - userEngagementDuration (seconds) -> to compute engagementTime/sessions
+    Returns per-pagePath table for given paths (+ optional hostName filter).
+
+    Output columns (what UI expects):
+      pagePath
+      views
+      activeUsers
+      sessions
+      engagementRate
+      avgSessionDuration_sec
     """
+    dims = ["pagePath"]
+    # Use engagedSessions to compute engagementRate robustly
+    mets = ["screenPageViews", "activeUsers", "sessions", "engagedSessions", "averageSessionDuration"]
 
-    dims = ["pagePath", "pageTitle"]
-    mets = ["screenPageViews", "activeUsers", "sessions", "engagementRate", "userEngagementDuration"]
-
-    # GA4 InListFilter has practical limits; chunk paths
-    all_frames: List[pd.DataFrame] = []
-
-    # host filter (if provided)
     host_expr: Optional[FilterExpression] = None
     if hosts_in:
         host_expr = _inlist_expr("hostName", list(hosts_in))
 
-    # IMPORTANT: use pagePath filter; if you need query string, switch to pagePathPlusQueryString
+    frames: List[pd.DataFrame] = []
     for part in _chunks(list(paths_in), 100):
         path_expr = _inlist_expr("pagePath", part)
-        filt = _and_expr([path_expr, host_expr] if host_expr is not None else [path_expr])
+        filt = _and_expr([path_expr, host_expr])
 
         df = _run_report(
             client=client,
@@ -293,33 +270,45 @@ def fetch_ga4_by_paths(
             dimension_filter=filt,
             limit=100000,
         )
-        all_frames.append(df)
+        frames.append(df)
 
-    if not all_frames:
+    if not frames:
         out = pd.DataFrame(columns=dims + mets)
     else:
-        out = pd.concat(all_frames, ignore_index=True)
-        # aggregate duplicates across chunks (same path/title)
-        grp = out.groupby(["pagePath", "pageTitle"], as_index=False)[mets].sum(numeric_only=True)
-        out = grp
+        out = pd.concat(frames, ignore_index=True)
 
-    # compute engagementTime/sessions (Average engagement time per session, seconds)
-    out["avgEngagementTime_sec"] = (out["userEngagementDuration"] / out["sessions"]).replace([pd.NA, pd.NaT], 0)
-    out["avgEngagementTime_sec"] = out["avgEngagementTime_sec"].fillna(0)
+    if not out.empty:
+        # Weighted average for averageSessionDuration by sessions (safe even if duplicates appear)
+        out["_asd_x_sess"] = (out["averageSessionDuration"] * out["sessions"]).fillna(0)
 
-    # optional: restore ordering by order_keys (paths)
+        agg = {
+            "screenPageViews": "sum",
+            "sessions": "sum",
+            "engagedSessions": "sum",
+            "activeUsers": "max",      # safer than sum if duplicates happen
+            "_asd_x_sess": "sum",
+        }
+        out = out.groupby("pagePath", as_index=False).agg(agg)
+
+        out["avgSessionDuration_sec"] = out["_asd_x_sess"].where(out["sessions"] > 0, 0) / out["sessions"].where(out["sessions"] > 0, 1)
+        out["engagementRate"] = out["engagedSessions"].where(out["sessions"] > 0, 0) / out["sessions"].where(out["sessions"] > 0, 1)
+
+        out = out.drop(columns=["_asd_x_sess"])
+
+    # Rename to UI contract
+    out = out.rename(columns={"screenPageViews": "views"})
+
+    # Ordering
     if order_keys:
         order_index = {p: i for i, p in enumerate(list(order_keys))}
         out["_ord"] = out["pagePath"].map(lambda x: order_index.get(x, 10**9))
-        out = out.sort_values(["_ord", "screenPageViews"], ascending=[True, False]).drop(columns=["_ord"])
+        out = out.sort_values(["_ord", "views"], ascending=[True, False]).drop(columns=["_ord"])
     else:
-        out = out.sort_values("screenPageViews", ascending=False)
+        if "views" in out.columns:
+            out = out.sort_values("views", ascending=False)
 
-    # keep only columns we care about
-    keep = ["pagePath", "pageTitle", "screenPageViews", "activeUsers", "sessions", "engagementRate", "avgEngagementTime_sec"]
-    out = out.reindex(columns=keep)
-
-    return out
+    keep = ["pagePath", "views", "activeUsers", "sessions", "engagementRate", "avgSessionDuration_sec"]
+    return out.reindex(columns=keep)
 
 
 def fetch_top_materials(
@@ -331,13 +320,19 @@ def fetch_top_materials(
 ) -> pd.DataFrame:
     """
     Top pages by Views with required metrics.
+
+    Output columns (what UI expects):
+      pagePath
+      views
+      activeUsers
+      sessions
+      engagementRate
+      avgSessionDuration_sec
     """
     dims = ["pagePath", "pageTitle"]
-    mets = ["screenPageViews", "activeUsers", "sessions", "engagementRate", "userEngagementDuration"]
+    mets = ["screenPageViews", "activeUsers", "sessions", "engagedSessions", "averageSessionDuration"]
 
-    order_bys = [
-        OrderBy(metric=OrderBy.MetricOrderBy(metric_name="screenPageViews"), desc=True)
-    ]
+    order_bys = [OrderBy(metric=OrderBy.MetricOrderBy(metric_name="screenPageViews"), desc=True)]
 
     df = _run_report(
         client=client,
@@ -351,8 +346,16 @@ def fetch_top_materials(
         order_bys=order_bys,
     )
 
-    df["avgEngagementTime_sec"] = (df["userEngagementDuration"] / df["sessions"]).fillna(0)
-    keep = ["pagePath", "pageTitle", "screenPageViews", "activeUsers", "sessions", "engagementRate", "avgEngagementTime_sec"]
+    if df.empty:
+        df["engagementRate"] = pd.Series(dtype="float64")
+        df["avgSessionDuration_sec"] = pd.Series(dtype="float64")
+    else:
+        df["avgSessionDuration_sec"] = df["averageSessionDuration"].fillna(0)
+        df["engagementRate"] = (df["engagedSessions"].where(df["sessions"] > 0, 0) / df["sessions"].where(df["sessions"] > 0, 1)).fillna(0)
+
+    df = df.rename(columns={"screenPageViews": "views"})
+
+    keep = ["pagePath", "pageTitle", "views", "activeUsers", "sessions", "engagementRate", "avgSessionDuration_sec"]
     return df.reindex(columns=keep)
 
 
@@ -364,11 +367,9 @@ def fetch_site_totals(
 ) -> Dict[str, float]:
     """
     Site totals for the period.
-    You said you need (left->right):
-      Views (Page Views) = screenPageViews
-      Sessions           = sessions
-      totalUsers         = totalUsers (Unique Users)
-      activeUsers        = activeUsers
+
+    Output keys (what UI expects):
+      views, sessions, totalUsers, activeUsers
     """
     df = _run_report(
         client=client,
@@ -382,28 +383,22 @@ def fetch_site_totals(
     )
 
     if df.empty:
-        return {"screenPageViews": 0, "sessions": 0, "totalUsers": 0, "activeUsers": 0}
+        return {"views": 0.0, "sessions": 0.0, "totalUsers": 0.0, "activeUsers": 0.0}
 
     row = df.iloc[0].to_dict()
-    # ensure keys exist
-    out = {
-        "screenPageViews": float(row.get("screenPageViews") or 0),
+    return {
+        "views": float(row.get("screenPageViews") or 0),
         "sessions": float(row.get("sessions") or 0),
         "totalUsers": float(row.get("totalUsers") or 0),
         "activeUsers": float(row.get("activeUsers") or 0),
     }
-    return out
 
 
-# ---------------------------
-# Optional: UI-friendly Russian column mapping
-# ---------------------------
-
+# Optional: UI-friendly Russian labels for contract fields
 RUS_METRIC_LABELS = {
-    "screenPageViews": "Просмотры",
+    "views": "Просмотры",
     "activeUsers": "Активные пользователи",
     "sessions": "Сессии",
     "engagementRate": "Доля вовлечённых сессий",
-    "avgEngagementTime_sec": "Средняя длительность сеанса",
+    "avgSessionDuration_sec": "Средняя длительность сеанса",
 }
-

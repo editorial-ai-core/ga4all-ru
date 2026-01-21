@@ -1,5 +1,6 @@
 # ga4_lib.py
 # GA4 helper library for Streamlit apps (Service Account + GA4 Data API)
+# Contract: always expose "views" to the app/UI.
 
 from __future__ import annotations
 
@@ -56,19 +57,16 @@ def build_config_from_streamlit_secrets(secrets: Any) -> GA4Config:
     - st.secrets behaves like a dict-like object.
     - private_key can be multi-line (preferred) OR contain \\n escapes.
     '''
-    # secrets may be a special Streamlit object; convert shallowly via dict()
     try:
         root = dict(secrets)
     except Exception:
         root = secrets  # type: ignore
 
-    # property id
     prop = root.get("GA4_PROPERTY_ID") or root.get("ga4_property_id") or root.get("property_id")
     if not prop or not isinstance(prop, str):
         raise GA4ConfigError("Missing secret: GA4_PROPERTY_ID (str)")
     prop = prop.strip()
 
-    # service account dict
     sa = root.get("gcp_service_account")
     if sa is None:
         raise GA4ConfigError("Missing secret: gcp_service_account (dict)")
@@ -78,13 +76,11 @@ def build_config_from_streamlit_secrets(secrets: Any) -> GA4Config:
         except Exception:
             raise GA4ConfigError("Bad secret type: gcp_service_account must be dict")
 
-    # normalize private_key (allow either real multiline or \n escapes)
     pk = sa.get("private_key")
     if isinstance(pk, str):
         if "\\n" in pk and "-----BEGIN PRIVATE KEY-----" in pk:
             sa["private_key"] = pk.replace("\\n", "\n")
 
-    # minimal fields validation
     for k in ("type", "client_email", "token_uri", "private_key"):
         if k not in sa or not isinstance(sa.get(k), str) or not str(sa.get(k)).strip():
             raise GA4ConfigError(f"Missing secret inside [gcp_service_account]: {k} (str)")
@@ -147,7 +143,7 @@ def collect_paths_hosts(lines: Sequence[str]) -> Tuple[List[str], List[str], Lis
                 out.append(x)
         return out
 
-    order_paths = paths[:]  # keep original ordering (can include duplicates)
+    order_paths = paths[:]  # can include duplicates
     return uniq(paths), uniq(hosts), order_paths
 
 
@@ -169,8 +165,8 @@ def _chunks(seq: Sequence[str], size: int) -> Iterable[List[str]]:
 def _inlist_expr(field_name: str, values: Sequence[str]) -> FilterExpression:
     """
     InListFilter type differs across google-analytics-data versions:
-    - sometimes it's exposed as Filter.InListFilter only (no top-level InListFilter import).
-    - case_sensitive may or may not be supported.
+    - sometimes it's only Filter.InListFilter (no top-level InListFilter import)
+    - case_sensitive may or may not exist
     """
     try:
         in_list = Filter.InListFilter(values=list(values), case_sensitive=False)
@@ -194,6 +190,24 @@ def _and_expr(parts: List[Optional[FilterExpression]]) -> Optional[FilterExpress
     return FilterExpression(and_group=FilterExpression.ListExpression(expressions=parts2))
 
 
+def _map_order_bys_metric(order_bys: Optional[List[OrderBy]], metric_map: Dict[str, str]) -> Optional[List[OrderBy]]:
+    if not order_bys:
+        return order_bys
+
+    out: List[OrderBy] = []
+    for ob in order_bys:
+        if ob.metric and ob.metric.metric_name in metric_map:
+            out.append(
+                OrderBy(
+                    metric=OrderBy.MetricOrderBy(metric_name=metric_map[ob.metric.metric_name]),
+                    desc=ob.desc,
+                )
+            )
+        else:
+            out.append(ob)
+    return out
+
+
 def _run_report(
     client: BetaAnalyticsDataClient,
     property_id: str,
@@ -205,34 +219,61 @@ def _run_report(
     limit: int = 100000,
     order_bys: Optional[List[OrderBy]] = None,
 ) -> pd.DataFrame:
-    req = RunReportRequest(
-        property=f"properties/{property_id}",
-        date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
-        dimensions=[Dimension(name=d) for d in dimensions],
-        metrics=[Metric(name=m) for m in metrics],
-        limit=limit,
-    )
-    if dimension_filter is not None:
-        req.dimension_filter = dimension_filter
-    if order_bys:
-        req.order_bys = order_bys
+    """
+    Always returns DataFrame with exactly the metric names requested in `metrics`.
+    If the backend/SDK doesn't accept 'views', we transparently retry with the compatible name,
+    but map the output column back to 'views'.
+    """
+    def run_once(metrics_for_request: List[str], order_bys_for_request: Optional[List[OrderBy]]) -> pd.DataFrame:
+        req = RunReportRequest(
+            property=f"properties/{property_id}",
+            date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+            dimensions=[Dimension(name=d) for d in dimensions],
+            metrics=[Metric(name=m) for m in metrics_for_request],
+            limit=limit,
+        )
+        if dimension_filter is not None:
+            req.dimension_filter = dimension_filter
+        if order_bys_for_request:
+            req.order_bys = order_bys_for_request
 
-    resp = client.run_report(req)
+        resp = client.run_report(req)
 
-    cols = list(dimensions) + list(metrics)
-    rows: List[List[Any]] = []
-    for r in resp.rows:
-        dvals = [dv.value for dv in r.dimension_values]
-        mvals = [mv.value for mv in r.metric_values]
-        rows.append(dvals + mvals)
+        cols = list(dimensions) + list(metrics_for_request)
+        rows: List[List[Any]] = []
+        for r in resp.rows:
+            dvals = [dv.value for dv in r.dimension_values]
+            mvals = [mv.value for mv in r.metric_values]
+            rows.append(dvals + mvals)
 
-    df = pd.DataFrame(rows, columns=cols)
+        df_ = pd.DataFrame(rows, columns=cols)
 
-    for m in metrics:
-        if m in df.columns:
-            df[m] = pd.to_numeric(df[m], errors="coerce")
+        for m in metrics_for_request:
+            if m in df_.columns:
+                df_[m] = pd.to_numeric(df_[m], errors="coerce")
+        return df_
 
-    return df
+    # First try with requested names (we want 'views' to stay 'views')
+    try:
+        df = run_once(metrics, order_bys)
+        return df
+    except Exception as e:
+        msg = str(e).lower()
+
+        # Fallback: some environments accept screenPageViews instead of views
+        if "views" in metrics and ("metric" in msg or "invalid" in msg or "not valid" in msg or "unknown" in msg):
+            metric_map = {"views": "screenPageViews"}
+            metrics2 = [metric_map.get(m, m) for m in metrics]
+            order_bys2 = _map_order_bys_metric(order_bys, metric_map)
+
+            df2 = run_once(metrics2, order_bys2)
+
+            # Map back to requested metric names
+            df2 = df2.rename(columns={"screenPageViews": "views"})
+            return df2
+
+        # If it's not about views metric, bubble up
+        raise
 
 
 # ---------------------------
@@ -249,19 +290,11 @@ def fetch_ga4_by_paths(
     order_keys: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     """
-    Returns per-pagePath table for given paths (+ optional hostName filter).
-
-    Output columns (what UI expects):
-      pagePath
-      views
-      activeUsers
-      sessions
-      engagementRate
-      avgSessionDuration_sec
+    Output columns (UI expects):
+      pagePath, views, activeUsers, sessions, engagementRate, avgSessionDuration_sec
     """
     dims = ["pagePath"]
-    # Use engagedSessions to compute engagementRate robustly
-    mets = ["screenPageViews", "activeUsers", "sessions", "engagedSessions", "averageSessionDuration"]
+    mets = ["views", "activeUsers", "sessions", "engagedSessions", "averageSessionDuration"]
 
     host_expr: Optional[FilterExpression] = None
     if hosts_in:
@@ -290,14 +323,10 @@ def fetch_ga4_by_paths(
         out = pd.concat(frames, ignore_index=True)
 
     if not out.empty:
-        # Weighted average for averageSessionDuration by sessions (safe even if duplicates happen)
         out["_asd_x_sess"] = (out["averageSessionDuration"] * out["sessions"]).fillna(0)
 
-        # If duplicates happen (should be rare), this aggregation is sane:
-        # - sum additive metrics
-        # - activeUsers is not additive; max is safer than sum
         agg = {
-            "screenPageViews": "sum",
+            "views": "sum",
             "sessions": "sum",
             "engagedSessions": "sum",
             "activeUsers": "max",
@@ -311,10 +340,6 @@ def fetch_ga4_by_paths(
 
         out = out.drop(columns=["_asd_x_sess"])
 
-    # Rename to UI contract
-    out = out.rename(columns={"screenPageViews": "views"})
-
-    # Ordering
     if order_keys:
         order_index = {p: i for i, p in enumerate(list(order_keys))}
         out["_ord"] = out["pagePath"].map(lambda x: order_index.get(x, 10**9))
@@ -335,20 +360,13 @@ def fetch_top_materials(
     limit: int = 10,
 ) -> pd.DataFrame:
     """
-    Top pages by Views with required metrics.
-
-    Output columns (what UI expects):
-      pagePath
-      views
-      activeUsers
-      sessions
-      engagementRate
-      avgSessionDuration_sec
+    Output columns (UI expects):
+      pagePath, views, activeUsers, sessions, engagementRate, avgSessionDuration_sec
     """
-    dims = ["pagePath", "pageTitle"]
-    mets = ["screenPageViews", "activeUsers", "sessions", "engagedSessions", "averageSessionDuration"]
+    dims = ["pagePath"]
+    mets = ["views", "activeUsers", "sessions", "engagedSessions", "averageSessionDuration"]
 
-    order_bys = [OrderBy(metric=OrderBy.MetricOrderBy(metric_name="screenPageViews"), desc=True)]
+    order_bys = [OrderBy(metric=OrderBy.MetricOrderBy(metric_name="views"), desc=True)]
 
     df = _run_report(
         client=client,
@@ -363,16 +381,14 @@ def fetch_top_materials(
     )
 
     if df.empty:
-        df["engagementRate"] = pd.Series(dtype="float64")
-        df["avgSessionDuration_sec"] = pd.Series(dtype="float64")
-    else:
-        df["avgSessionDuration_sec"] = df["averageSessionDuration"].fillna(0)
-        denom_sessions = df["sessions"].where(df["sessions"] > 0, 1)
-        df["engagementRate"] = (df["engagedSessions"] / denom_sessions).fillna(0)
+        out = pd.DataFrame(columns=["pagePath", "views", "activeUsers", "sessions", "engagementRate", "avgSessionDuration_sec"])
+        return out
 
-    df = df.rename(columns={"screenPageViews": "views"})
+    denom = df["sessions"].where(df["sessions"] > 0, 1)
+    df["engagementRate"] = (df["engagedSessions"] / denom).fillna(0)
+    df["avgSessionDuration_sec"] = df["averageSessionDuration"].fillna(0)
 
-    keep = ["pagePath", "pageTitle", "views", "activeUsers", "sessions", "engagementRate", "avgSessionDuration_sec"]
+    keep = ["pagePath", "views", "activeUsers", "sessions", "engagementRate", "avgSessionDuration_sec"]
     return df.reindex(columns=keep)
 
 
@@ -383,9 +399,7 @@ def fetch_site_totals(
     end_date: str,
 ) -> Dict[str, float]:
     """
-    Site totals for the period.
-
-    Output keys (what UI expects):
+    Output keys (UI expects):
       views, sessions, totalUsers, activeUsers
     """
     df = _run_report(
@@ -394,7 +408,7 @@ def fetch_site_totals(
         start_date=start_date,
         end_date=end_date,
         dimensions=[],
-        metrics=["screenPageViews", "sessions", "totalUsers", "activeUsers"],
+        metrics=["views", "sessions", "totalUsers", "activeUsers"],
         dimension_filter=None,
         limit=1,
     )
@@ -404,7 +418,7 @@ def fetch_site_totals(
 
     row = df.iloc[0].to_dict()
     return {
-        "views": float(row.get("screenPageViews") or 0),
+        "views": float(row.get("views") or 0),
         "sessions": float(row.get("sessions") or 0),
         "totalUsers": float(row.get("totalUsers") or 0),
         "activeUsers": float(row.get("activeUsers") or 0),

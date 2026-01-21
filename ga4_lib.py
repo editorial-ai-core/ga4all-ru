@@ -1,398 +1,449 @@
-from __future__ import annotations
-
+import re
+import json
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional, Tuple, Dict, List
-from collections.abc import Mapping
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
+
+from google.analytics.data_v1beta import BetaAnalyticsDataClient
+from google.analytics.data_v1beta.types import (
+    DateRange,
+    Dimension,
+    Metric,
+    FilterExpression,
+    Filter,
+    RunReportRequest,
+    OrderBy,
+)
+from google.oauth2 import service_account
 
 
 # ----------------------------
 # Errors / Config
 # ----------------------------
-
-class GA4ConfigError(RuntimeError):
+class GA4ConfigError(Exception):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass
 class GA4Config:
     property_id: str
-    service_account_info: dict[str, Any]
-    scopes: tuple[str, ...] = ("https://www.googleapis.com/auth/analytics.readonly",)
+    service_account_info: Dict[str, Any]
 
 
-def _as_mapping(x: Any) -> Optional[Mapping]:
-    return x if isinstance(x, Mapping) else None
+def _as_dict(value: Any) -> Optional[Dict[str, Any]]:
+    """Streamlit secrets иногда дают table/dict, иногда строку JSON."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        # пробуем JSON
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
+    return None
+
+
+def _fix_private_key(sa: Dict[str, Any]) -> Dict[str, Any]:
+    """Приводим private_key к виду с реальными переводами строк."""
+    sa = dict(sa)
+    pk = sa.get("private_key")
+    if isinstance(pk, str):
+        # если прилетело с \n внутри строки
+        sa["private_key"] = pk.replace("\\n", "\n")
+    return sa
 
 
 def build_config_from_streamlit_secrets(secrets: Any) -> GA4Config:
     """
-    Expected secrets.toml:
-
-    GA4_PROPERTY_ID = "123456789"
-
-    [gcp_service_account]
-    type = "service_account"
-    project_id = "..."
-    private_key_id = "..."
-    private_key = """-----BEGIN PRIVATE KEY-----
-    ...
-    -----END PRIVATE KEY-----"""
-    client_email = "....iam.gserviceaccount.com"
-    token_uri = "https://oauth2.googleapis.com/token"
+    Ожидаем в secrets:
+      GA4_PROPERTY_ID = "123"
+      [gcp_service_account]
+      type="service_account"
+      ...
+    Дополнительно принимаем варианты ключей property id:
+      ga4_property_id / property_id / GA4_PROPERTY_ID
     """
-    if not hasattr(secrets, "get"):
-        raise GA4ConfigError("Secrets must be Mapping-like (st.secrets).")
+    if secrets is None:
+        raise GA4ConfigError("Secrets пустые: добавь GA4_PROPERTY_ID и [gcp_service_account].")
 
-    property_id = str(secrets.get("GA4_PROPERTY_ID", "")).strip()
-    if not property_id:
-        raise GA4ConfigError("Missing secret: GA4_PROPERTY_ID")
+    # Property ID: несколько возможных имён
+    pid = None
+    for k in ("GA4_PROPERTY_ID", "ga4_property_id", "property_id", "GA4PropertyID"):
+        try:
+            v = secrets.get(k)  # streamlit secrets behaves like dict
+        except Exception:
+            v = None
+        if isinstance(v, str) and v.strip():
+            pid = v.strip()
+            break
 
-    sa = secrets.get("gcp_service_account", None)
-    sa_map = _as_mapping(sa)
-    if sa_map is None:
-        raise GA4ConfigError("Missing secret: gcp_service_account (dict/table)")
+    if not pid:
+        raise GA4ConfigError("Missing secret: GA4_PROPERTY_ID (string)")
 
-    # Streamlit returns AttrDict/Mapping; convert to plain dict
-    sa_dict = dict(sa_map)
+    # Service account table
+    try:
+        raw_sa = secrets.get("gcp_service_account")
+    except Exception:
+        raw_sa = None
 
-    # minimal sanity
-    if not sa_dict.get("client_email") or not sa_dict.get("private_key"):
-        raise GA4ConfigError("gcp_service_account must contain at least client_email and private_key")
+    sa = _as_dict(raw_sa)
+    if not sa:
+        raise GA4ConfigError("Missing secret: gcp_service_account (dict)")
 
-    return GA4Config(property_id=property_id, service_account_info=sa_dict)
+    sa = _fix_private_key(sa)
+
+    if sa.get("type") != "service_account":
+        raise GA4ConfigError("gcp_service_account.type должен быть 'service_account'")
+
+    if not sa.get("client_email") or not sa.get("private_key"):
+        raise GA4ConfigError("gcp_service_account должен содержать минимум client_email и private_key")
+
+    return GA4Config(property_id=pid, service_account_info=sa)
 
 
-def make_client(cfg: GA4Config):
-    """
-    Returns BetaAnalyticsDataClient.
-    Imports are inside to keep module import light.
-    """
-    from google.oauth2 import service_account
-    from google.analytics.data_v1beta import BetaAnalyticsDataClient
-
+def make_client(cfg: GA4Config) -> BetaAnalyticsDataClient:
+    scopes = ["https://www.googleapis.com/auth/analytics.readonly"]
     creds = service_account.Credentials.from_service_account_info(
-        cfg.service_account_info,
-        scopes=list(cfg.scopes),
+        cfg.service_account_info, scopes=scopes
     )
     return BetaAnalyticsDataClient(credentials=creds)
 
 
 # ----------------------------
-# URL / Path parsing
+# URL parsing helpers
 # ----------------------------
-
-INVISIBLE = ("\ufeff", "\u200b", "\u2060", "\u00a0")
-
-
-def _clean(s: Any) -> str:
-    s = "" if s is None else str(s)
-    for ch in INVISIBLE:
-        s = s.replace(ch, "")
-    return s.strip()
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 
-def _strip_utm_and_fragment(raw_url: str) -> str:
-    p = urlparse(raw_url)
-    q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if not k.lower().startswith("utm_")]
-    return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), ""))
-
-
-def _looks_like_domain_no_scheme(s: str) -> bool:
-    s = s.strip()
-    if not s or s.startswith("/"):
-        return False
-    head = s.split("/")[0]
-    return (" " not in s) and ("." in head) and (":" not in head)
-
-
-def _normalize_input_to_path_host(raw: str) -> Tuple[str, Optional[str]]:
+def _extract_host_and_path(line: str) -> Tuple[Optional[str], str]:
     """
-    Accepts:
-      - https://domain/path
-      - domain/path
-      - /path
-      - path
-    Returns:
-      ("/path", "domain") OR ("/path", None)
+    Принимаем:
+      - полный URL https://example.com/path?a=b
+      - путь /path
+      - путь без слэша path
+    Возвращаем (hostname|None, /path)
     """
-    s = _clean(raw)
+    s = (line or "").strip()
     if not s:
-        return "", None
+        return None, ""
 
-    if _looks_like_domain_no_scheme(s):
-        s = "https://" + s
-
-    if s.lower().startswith(("http://", "https://")):
-        s2 = _strip_utm_and_fragment(s)
-        p = urlparse(s2)
-        host = p.hostname or None
-        path = p.path or "/"
+    if _URL_RE.match(s):
+        # простая разборка без urlparse чтобы избежать “кривых” случаев — достаточно для GA4
+        s2 = re.sub(r"^https?://", "", s, flags=re.IGNORECASE)
+        parts = s2.split("/", 1)
+        host = parts[0].strip().lower()
+        path = "/" + parts[1] if len(parts) > 1 else "/"
+        # убираем query/fragment
+        path = path.split("?", 1)[0].split("#", 1)[0]
         if not path.startswith("/"):
             path = "/" + path
-        return path, host
+        return host, path
 
-    # treat as path
-    if not s.startswith("/"):
-        s = "/" + s
-    return s, None
+    # не URL — считаем что это path
+    path = s.split("?", 1)[0].split("#", 1)[0]
+    if not path.startswith("/"):
+        path = "/" + path
+    return None, path
 
 
-def collect_paths_hosts(lines: Iterable[str]) -> Tuple[List[str], List[str], List[str]]:
+def collect_paths_hosts(lines: Sequence[str]) -> Tuple[List[str], List[str], List[str]]:
     """
-    Returns:
-      unique_paths: list[str]  (for GA4 filter)
-      hosts: list[str]         (if extracted from URLs)
-      order_paths: list[str]   (original unique order for stable output ordering)
+    Возвращает:
+      unique_paths: уникальные пути
+      hostnames: уникальные хосты (если были URL)
+      order_paths: порядок путей как ввели (для сортировки результата)
     """
-    seen_path = set()
     order_paths: List[str] = []
+    paths_set = set()
     hosts_set = set()
 
-    for raw in lines:
-        path, host = _normalize_input_to_path_host(raw)
+    for line in lines:
+        host, path = _extract_host_and_path(line)
         if not path:
             continue
-        if path not in seen_path:
-            seen_path.add(path)
-            order_paths.append(path)
+        order_paths.append(path)
+
+        if path not in paths_set:
+            paths_set.add(path)
         if host:
-            hosts_set.add(host.lower())
+            hosts_set.add(host)
 
-    unique_paths = list(seen_path)
-    hosts = sorted(hosts_set)
-    return unique_paths, hosts, order_paths
+    unique_paths = list(paths_set)
+    hostnames = list(hosts_set)
+
+    return unique_paths, hostnames, order_paths
 
 
 # ----------------------------
-# GA4 Data API helpers
+# GA4 Query helpers
 # ----------------------------
+def _in_list_filter(field_name: str, values: Sequence[str]) -> FilterExpression:
+    # OR-цепочка: field == v1 OR field == v2 ...
+    exprs: List[FilterExpression] = []
+    for v in values:
+        exprs.append(
+            FilterExpression(
+                filter=Filter(
+                    field_name=field_name,
+                    string_filter=Filter.StringFilter(
+                        match_type=Filter.StringFilter.MatchType.EXACT,
+                        value=v,
+                        case_sensitive=False,
+                    ),
+                )
+            )
+        )
+    return FilterExpression(or_group=FilterExpression.ListExpression(expressions=exprs))
 
-def _chunks(items: List[str], size: int) -> Iterable[List[str]]:
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
+
+def _and_filters(filters: List[FilterExpression]) -> Optional[FilterExpression]:
+    if not filters:
+        return None
+    if len(filters) == 1:
+        return filters[0]
+    return FilterExpression(and_group=FilterExpression.ListExpression(expressions=filters))
 
 
-def _run_report_df(client, property_id: str, dimensions: List[str], metrics: List[str],
-                   start_date: str, end_date: str,
-                   dim_filter_expression=None,
-                   order_by_metric: Optional[str] = None,
-                   desc: bool = True,
-                   limit: Optional[int] = None) -> pd.DataFrame:
-    from google.analytics.data_v1beta.types import (
-        DateRange, Dimension, Metric, RunReportRequest, OrderBy
-    )
-
-    req = RunReportRequest(
-        property=f"properties/{property_id}",
-        date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
-        dimensions=[Dimension(name=d) for d in dimensions],
-        metrics=[Metric(name=m) for m in metrics],
-    )
-
-    if dim_filter_expression is not None:
-        req.dimension_filter = dim_filter_expression
-
-    if order_by_metric:
-        req.order_bys = [OrderBy(metric=OrderBy.MetricOrderBy(metric_name=order_by_metric), desc=desc)]
-
-    if limit is not None:
-        req.limit = int(limit)
-
-    resp = client.run_report(req)
-
-    cols = [d.name for d in resp.dimension_headers] + [m.name for m in resp.metric_headers]
+def _rows_to_df(response, dim_names: List[str], metric_names: List[str]) -> pd.DataFrame:
     rows = []
-    for r in resp.rows:
-        dim_vals = [v.value for v in r.dimension_values]
-        met_vals = [v.value for v in r.metric_values]
-        rows.append(dim_vals + met_vals)
+    for r in response.rows:
+        dvals = [dv.value for dv in r.dimension_values]
+        mvals = [mv.value for mv in r.metric_values]
+        row = {}
+        for k, v in zip(dim_names, dvals):
+            row[k] = v
+        for k, v in zip(metric_names, mvals):
+            # все метрики приходят строками
+            try:
+                if "." in v:
+                    row[k] = float(v)
+                else:
+                    row[k] = int(v)
+            except Exception:
+                row[k] = v
+        rows.append(row)
 
-    df = pd.DataFrame(rows, columns=cols)
+    return pd.DataFrame(rows)
 
-    # Cast numeric metrics
-    for m in metrics:
-        if m in df.columns:
-            df[m] = pd.to_numeric(df[m], errors="coerce")
 
+def _add_avg_session_duration(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    avgSessionDuration_sec = userEngagementDuration / sessions
+    userEngagementDuration — в секундах (GA4 Data API).
+    """
+    if "userEngagementDuration" in df.columns and "sessions" in df.columns:
+        def safe_div(a, b):
+            try:
+                b = float(b)
+                if b == 0:
+                    return 0.0
+                return float(a) / b
+            except Exception:
+                return 0.0
+
+        df["avgSessionDuration_sec"] = [
+            safe_div(a, b) for a, b in zip(df["userEngagementDuration"], df["sessions"])
+        ]
+    else:
+        df["avgSessionDuration_sec"] = 0.0
     return df
 
 
-def _make_inlist_filter(dim_name: str, values: List[str]):
-    from google.analytics.data_v1beta.types import Filter, FilterExpression
-    return FilterExpression(
-        filter=Filter(
-            field_name=dim_name,
-            in_list_filter=Filter.InListFilter(values=values),
-        )
-    )
-
-
-def _make_and_filter(exprs: List[Any]):
-    from google.analytics.data_v1beta.types import FilterExpression
-    if len(exprs) == 1:
-        return exprs[0]
-    return FilterExpression(and_group=FilterExpression.List(expressions=exprs))
-
-
+# ----------------------------
+# Public API
+# ----------------------------
 def fetch_ga4_by_paths(
-    client,
+    client: BetaAnalyticsDataClient,
     property_id: str,
-    paths_in: List[str],
-    hosts_in: List[str],
+    paths_in: Sequence[str],
+    hosts_in: Optional[Sequence[str]],
     start_date: str,
     end_date: str,
-    order_keys: Optional[List[str]] = None,
-    chunk_size: int = 50,
+    order_keys: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     """
-    URL Analytics:
-    Returns DataFrame with:
-      pagePath, pageTitle, views, activeUsers, sessions, engagementRate, engagementTime,
-      avgSessionDuration_sec
+    Для URL Analytics:
+      dimensions: pagePath
+      metrics: views, activeUsers, sessions, engagementRate, userEngagementDuration
     """
-    # What we collect (as requested)
-    dimensions = ["pagePath", "pageTitle"]
-    metrics = ["views", "activeUsers", "sessions", "engagementRate", "engagementTime"]
-
-    dfs: List[pd.DataFrame] = []
-
-    # Build host filter once (optional)
-    host_expr = _make_inlist_filter("hostName", hosts_in) if hosts_in else None
-
-    # Run in chunks for many paths
-    paths_in = [p for p in paths_in if p]
+    if not property_id:
+        raise GA4ConfigError("property_id пуст")
     if not paths_in:
-        return pd.DataFrame(columns=dimensions + metrics + ["avgSessionDuration_sec"])
-
-    for part in _chunks(paths_in, chunk_size):
-        path_expr = _make_inlist_filter("pagePath", part)
-        exprs = [path_expr]
-        if host_expr is not None:
-            exprs.append(host_expr)
-        dim_filter = _make_and_filter(exprs)
-
-        df = _run_report_df(
-            client=client,
-            property_id=property_id,
-            dimensions=dimensions,
-            metrics=metrics,
-            start_date=start_date,
-            end_date=end_date,
-            dim_filter_expression=dim_filter,
-            order_by_metric=None,
-            limit=None,
+        return pd.DataFrame(
+            columns=["pagePath", "views", "activeUsers", "sessions", "engagementRate", "avgSessionDuration_sec"]
         )
-        dfs.append(df)
 
-    if not dfs:
-        return pd.DataFrame(columns=dimensions + metrics + ["avgSessionDuration_sec"])
+    dims = [Dimension(name="pagePath")]
+    metrics = [
+        Metric(name="screenPageViews"),     # Views
+        Metric(name="activeUsers"),
+        Metric(name="sessions"),
+        Metric(name="engagementRate"),
+        Metric(name="userEngagementDuration"),
+    ]
 
-    out = pd.concat(dfs, ignore_index=True)
+    filters: List[FilterExpression] = []
+    filters.append(_in_list_filter("pagePath", list(paths_in)))
 
-    # Aggregate duplicates (can happen across chunks or because titles change)
-    agg = {
-        "views": "sum",
-        "activeUsers": "sum",
-        "sessions": "sum",
-        "engagementTime": "sum",
-        # engagementRate нельзя суммировать напрямую — пересчитаем позже
-        "engagementRate": "mean",
-        "pageTitle": "last",
-    }
-    out = out.groupby("pagePath", as_index=False).agg(agg)
+    # hostName фильтр делаем только если реально передали hosts
+    if hosts_in:
+        hosts = [h.strip().lower() for h in hosts_in if h and h.strip()]
+        if hosts:
+            filters.append(_in_list_filter("hostName", hosts))
 
-    # Recompute engagementRate more reasonably if possible:
-    # engagedSessions not requested; keep mean as pragmatic.
-    # (If you want exact: request engagedSessions and compute engagedSessions/sessions)
-    # Compute avg session duration
-    out["avgSessionDuration_sec"] = (out["engagementTime"] / out["sessions"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+    dimension_filter = _and_filters(filters)
 
-    # Stable ordering by input order if provided
+    req = RunReportRequest(
+        property="properties/%s" % str(property_id),
+        dimensions=dims,
+        metrics=metrics,
+        date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+        dimension_filter=dimension_filter,
+    )
+
+    resp = client.run_report(req)
+
+    df = _rows_to_df(
+        resp,
+        dim_names=["pagePath"],
+        metric_names=["screenPageViews", "activeUsers", "sessions", "engagementRate", "userEngagementDuration"],
+    )
+
+    if df.empty:
+        df = pd.DataFrame(
+            columns=["pagePath", "views", "activeUsers", "sessions", "engagementRate", "avgSessionDuration_sec"]
+        )
+        return df
+
+    # Переименовываем screenPageViews -> views
+    df = df.rename(columns={"screenPageViews": "views"})
+
+    df = _add_avg_session_duration(df)
+
+    # Переупорядочим согласно вводу
     if order_keys:
-        order_map = {p: i for i, p in enumerate(order_keys)}
-        out["_ord"] = out["pagePath"].map(order_map).fillna(10**9).astype(int)
-        out = out.sort_values(["_ord", "views"], ascending=[True, False]).drop(columns=["_ord"])
-    else:
-        out = out.sort_values("views", ascending=False)
+        order_map = {}
+        idx = 0
+        for p in order_keys:
+            if p not in order_map:
+                order_map[p] = idx
+                idx += 1
+        df["_ord"] = df["pagePath"].map(lambda x: order_map.get(x, 10**9))
+        df = df.sort_values(["_ord", "pagePath"]).drop(columns=["_ord"], errors="ignore")
 
-    return out.reset_index(drop=True)
+    # финальный набор
+    cols = ["pagePath", "views", "activeUsers", "sessions", "engagementRate", "avgSessionDuration_sec"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = 0
+    return df[cols]
 
 
 def fetch_top_materials(
-    client,
+    client: BetaAnalyticsDataClient,
     property_id: str,
     start_date: str,
     end_date: str,
     limit: int = 10,
-    host_filter: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
-    Top materials:
-    Returns DataFrame with:
-      pagePath, views, activeUsers, sessions, engagementRate, engagementTime, avgSessionDuration_sec
+    Для вкладки "Топ материалов":
+      dimension: pagePath
+      metrics: views, activeUsers, sessions, engagementRate, userEngagementDuration
+      sort: views desc
     """
-    dimensions = ["pagePath"]
-    metrics = ["views", "activeUsers", "sessions", "engagementRate", "engagementTime"]
+    dims = [Dimension(name="pagePath")]
+    metrics = [
+        Metric(name="screenPageViews"),
+        Metric(name="activeUsers"),
+        Metric(name="sessions"),
+        Metric(name="engagementRate"),
+        Metric(name="userEngagementDuration"),
+    ]
 
-    dim_filter = None
-    if host_filter:
-        dim_filter = _make_inlist_filter("hostName", host_filter)
-
-    df = _run_report_df(
-        client=client,
-        property_id=property_id,
-        dimensions=dimensions,
+    req = RunReportRequest(
+        property="properties/%s" % str(property_id),
+        dimensions=dims,
         metrics=metrics,
-        start_date=start_date,
-        end_date=end_date,
-        dim_filter_expression=dim_filter,
-        order_by_metric="views",
-        desc=True,
+        date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+        order_bys=[
+            OrderBy(metric=OrderBy.MetricOrderBy(metric_name="screenPageViews"), desc=True)
+        ],
         limit=int(limit),
     )
 
-    if df.empty:
-        df["avgSessionDuration_sec"] = []
-        return df
+    resp = client.run_report(req)
 
-    df["avgSessionDuration_sec"] = (df["engagementTime"] / df["sessions"]).replace([float("inf"), -float("inf")], 0).fillna(0)
-    return df
-
-
-def fetch_site_totals(
-    client,
-    property_id: str,
-    start_date: str,
-    end_date: str,
-) -> Dict[str, float]:
-    """
-    Totals:
-    Must return keys:
-      views, sessions, totalUsers, activeUsers
-    """
-    df = _run_report_df(
-        client=client,
-        property_id=property_id,
-        dimensions=[],
-        metrics=["views", "sessions", "totalUsers", "activeUsers"],
-        start_date=start_date,
-        end_date=end_date,
-        dim_filter_expression=None,
-        order_by_metric=None,
-        limit=1,
+    df = _rows_to_df(
+        resp,
+        dim_names=["pagePath"],
+        metric_names=["screenPageViews", "activeUsers", "sessions", "engagementRate", "userEngagementDuration"],
     )
 
     if df.empty:
+        return pd.DataFrame(
+            columns=["pagePath", "views", "activeUsers", "sessions", "engagementRate", "avgSessionDuration_sec"]
+        )
+
+    df = df.rename(columns={"screenPageViews": "views"})
+    df = _add_avg_session_duration(df)
+
+    cols = ["pagePath", "views", "activeUsers", "sessions", "engagementRate", "avgSessionDuration_sec"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = 0
+    return df[cols]
+
+
+def fetch_site_totals(
+    client: BetaAnalyticsDataClient,
+    property_id: str,
+    start_date: str,
+    end_date: str,
+) -> Dict[str, Any]:
+    """
+    Для вкладки "Общие данные по сайту":
+      metrics: views (screenPageViews), sessions, totalUsers, activeUsers
+    Возвращаем:
+      {"views":..., "sessions":..., "totalUsers":..., "activeUsers":...}
+    """
+    metrics = [
+        Metric(name="screenPageViews"),
+        Metric(name="sessions"),
+        Metric(name="totalUsers"),
+        Metric(name="activeUsers"),
+    ]
+
+    req = RunReportRequest(
+        property="properties/%s" % str(property_id),
+        dimensions=[],
+        metrics=metrics,
+        date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+    )
+
+    resp = client.run_report(req)
+
+    if not resp.rows:
         return {"views": 0, "sessions": 0, "totalUsers": 0, "activeUsers": 0}
 
-    row = df.iloc[0].to_dict()
-    # ensure numeric
+    row = resp.rows[0]
+    m = [mv.value for mv in row.metric_values]
+
+    def as_int(x):
+        try:
+            return int(float(x))
+        except Exception:
+            return 0
+
     return {
-        "views": float(row.get("views") or 0),
-        "sessions": float(row.get("sessions") or 0),
-        "totalUsers": float(row.get("totalUsers") or 0),
-        "activeUsers": float(row.get("activeUsers") or 0),
+        "views": as_int(m[0]),
+        "sessions": as_int(m[1]),
+        "totalUsers": as_int(m[2]),
+        "activeUsers": as_int(m[3]),
     }

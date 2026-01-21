@@ -1,27 +1,27 @@
 # -*- coding: utf-8 -*-
-# ga4_lib.py — reusable GA4 helpers (no Streamlit dependency)
+"""
+ga4_lib.py — reusable GA4 helpers (NO Streamlit dependency)
+
+Ключевая фишка для Streamlit Cloud:
+- все google-импорты сделаны "ленивыми" (внутри функций),
+  чтобы приложение не падало на старте из-за зависимости.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
-
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import numpy as np
 import pandas as pd
-from google.oauth2 import service_account
-from google.analytics.data_v1beta import BetaAnalyticsDataClient
-from google.analytics.data_v1beta.types import (
-    RunReportRequest, Dimension, Metric, Filter, FilterExpression,
-    FilterExpressionList, OrderBy
-)
+
 
 # ----------------------------
 # Config / Auth
 # ----------------------------
 
-GA4_READONLY_SCOPES = ["https://www.googleapis.com/auth/analytics.readonly"]
+GA4_READONLY_SCOPES = ("https://www.googleapis.com/auth/analytics.readonly",)
 
 
 class GA4ConfigError(RuntimeError):
@@ -32,7 +32,7 @@ class GA4ConfigError(RuntimeError):
 class GA4Config:
     property_id: str
     service_account_info: dict[str, Any]
-    scopes: tuple[str, ...] = tuple(GA4_READONLY_SCOPES)
+    scopes: tuple[str, ...] = GA4_READONLY_SCOPES
 
 
 def build_config_from_secrets(secrets: Any) -> GA4Config:
@@ -42,18 +42,28 @@ def build_config_from_secrets(secrets: Any) -> GA4Config:
       GA4_PROPERTY_ID
       gcp_service_account (dict)
     """
-    pid = str(getattr(secrets, "get", lambda k, d=None: d)("GA4_PROPERTY_ID", "")).strip()
+    getter = getattr(secrets, "get", None)
+    if not callable(getter):
+        raise GA4ConfigError("Secrets object must be Mapping-like (have .get())")
+
+    pid = str(getter("GA4_PROPERTY_ID", "")).strip()
     if not pid:
         raise GA4ConfigError("Missing secret: GA4_PROPERTY_ID")
 
-    sa = getattr(secrets, "get", lambda k, d=None: d)("gcp_service_account", None)
+    sa = getter("gcp_service_account", None)
     if not sa or not isinstance(sa, dict):
         raise GA4ConfigError("Missing secret: gcp_service_account (dict)")
 
     return GA4Config(property_id=pid, service_account_info=dict(sa))
 
 
-def make_client(cfg: GA4Config) -> BetaAnalyticsDataClient:
+def make_client(cfg: GA4Config):
+    """
+    Возвращает BetaAnalyticsDataClient. Импорты внутри функции.
+    """
+    from google.oauth2 import service_account
+    from google.analytics.data_v1beta import BetaAnalyticsDataClient
+
     creds = service_account.Credentials.from_service_account_info(
         cfg.service_account_info,
         scopes=list(cfg.scopes),
@@ -67,7 +77,7 @@ def make_client(cfg: GA4Config) -> BetaAnalyticsDataClient:
 
 INVISIBLE = ("\ufeff", "\u200b", "\u2060", "\u00a0")
 
-METRICS_PAGE = ["screenPageViews", "activeUsers", "userEngagementDuration"]
+METRICS_PAGE = ("screenPageViews", "activeUsers", "userEngagementDuration")
 
 
 def clean_line(s: str) -> str:
@@ -178,7 +188,18 @@ def read_uploaded_lines(uploaded) -> list[str]:
 # GA4 Queries
 # ----------------------------
 
-def make_path_filter(paths_batch: list[str]) -> FilterExpression:
+def _empty_paths_df(with_host: bool) -> pd.DataFrame:
+    cols = ["pagePath", "pageTitle"] + (["hostName"] if with_host else []) + list(METRICS_PAGE)
+    return pd.DataFrame(columns=cols)
+
+
+def make_path_filter(paths_batch: list[str]):
+    """
+    Build FilterExpression OR-group for pagePath begins_with for each path.
+    Импорты внутри функции.
+    """
+    from google.analytics.data_v1beta.types import Filter, FilterExpression, FilterExpressionList
+
     exprs = [
         FilterExpression(
             filter=Filter(
@@ -195,13 +216,8 @@ def make_path_filter(paths_batch: list[str]) -> FilterExpression:
     return FilterExpression(or_group=FilterExpressionList(expressions=exprs))
 
 
-def _empty_paths_df(with_host: bool) -> pd.DataFrame:
-    cols = ["pagePath", "pageTitle"] + (["hostName"] if with_host else []) + METRICS_PAGE
-    return pd.DataFrame(columns=cols)
-
-
 def fetch_ga4_by_paths(
-    client: BetaAnalyticsDataClient,
+    client,
     property_id: str,
     paths_in: list[str],
     hosts_in: list[str],
@@ -211,11 +227,17 @@ def fetch_ga4_by_paths(
     batch_size: int = 25,
     limit: int = 100000,
 ) -> pd.DataFrame:
+    """
+    Возвращает DataFrame по заданным pagePath (с сохранением исходного порядка order_keys).
+    """
+    from google.analytics.data_v1beta.types import (
+        RunReportRequest, Dimension, Metric, Filter, FilterExpression, FilterExpressionList
+    )
+
     if not property_id:
         raise ValueError("property_id is empty")
 
     want_host = bool(hosts_in)
-
     if not paths_in:
         return _empty_paths_df(want_host)
 
@@ -228,7 +250,7 @@ def fetch_ga4_by_paths(
 
         dims = [Dimension(name="pagePath"), Dimension(name="pageTitle")]
 
-        # если юзер вставил домены — ограничим по hostName (но аккуратно: GA4 может вернуть hostName пустым)
+        # если юзер вставил домены — ограничим по hostName
         if want_host:
             host_expr = FilterExpression(
                 filter=Filter(
@@ -288,7 +310,7 @@ def fetch_ga4_by_paths(
     else:
         df = _empty_paths_df(want_host)
 
-    # добавляем нулевые строки для всех запрошенных путей (чтобы всегда было что показать)
+    # добавляем нулевые строки для всех запрошенных путей
     present = set(df["pagePath"].tolist()) if not df.empty else set()
     missing_unique = [p for p in paths_in if p not in present]
     if missing_unique:
@@ -308,13 +330,6 @@ def fetch_ga4_by_paths(
     df = df.set_index("pagePath").reindex(order_keys).reset_index()
 
     # производные метрики
-    if "activeUsers" not in df.columns:
-        df["activeUsers"] = 0
-    if "screenPageViews" not in df.columns:
-        df["screenPageViews"] = 0
-    if "userEngagementDuration" not in df.columns:
-        df["userEngagementDuration"] = 0
-
     den = pd.to_numeric(df["activeUsers"], errors="coerce").replace(0, np.nan).astype(float)
     df["viewsPerActiveUser"] = (
         pd.to_numeric(df["screenPageViews"], errors="coerce").astype(float) / den
@@ -327,12 +342,17 @@ def fetch_ga4_by_paths(
 
 
 def fetch_top_materials(
-    client: BetaAnalyticsDataClient,
+    client,
     property_id: str,
     start_date: str,
     end_date: str,
     limit: int,
 ) -> pd.DataFrame:
+    """
+    Топ материалов по screenPageViews.
+    """
+    from google.analytics.data_v1beta.types import RunReportRequest, Dimension, Metric, OrderBy
+
     req = RunReportRequest(
         property=f"properties/{property_id}",
         dimensions=[Dimension(name="pagePath"), Dimension(name="pageTitle")],
@@ -359,11 +379,16 @@ def fetch_top_materials(
 
 
 def fetch_site_totals(
-    client: BetaAnalyticsDataClient,
+    client,
     property_id: str,
     start_date: str,
     end_date: str,
 ) -> pd.DataFrame:
+    """
+    Общие итоги по сайту (sessions, totalUsers, screenPageViews)
+    """
+    from google.analytics.data_v1beta.types import RunReportRequest, Metric
+
     req = RunReportRequest(
         property=f"properties/{property_id}",
         metrics=[Metric(name="sessions"), Metric(name="totalUsers"), Metric(name="screenPageViews")],

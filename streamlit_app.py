@@ -1,3 +1,4 @@
+# streamlit_app.py
 import base64
 from datetime import date, timedelta
 from pathlib import Path
@@ -5,19 +6,15 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from ga4_lib import (
-    GA4ConfigError,
-    build_config_from_streamlit_secrets,
-    collect_paths_hosts,
-    fetch_ga4_by_paths,
-    fetch_site_totals,
-    fetch_top_materials,
-    make_client,
-)
+# ВАЖНО: не используем "from ga4_lib import (...)" чтобы исключить SyntaxError на импорте.
+try:
+    import ga4_lib as ga
+except Exception as e:
+    st.set_page_config(page_title="Analytics Console", layout="wide")
+    st.error("Не удалось импортировать ga4_lib.py")
+    st.code(str(e))
+    st.stop()
 
-# ----------------------------
-# Page
-# ----------------------------
 st.set_page_config(page_title="Analytics Console", layout="wide")
 
 ASSETS_DIR = Path(__file__).parent / "assets"
@@ -84,10 +81,10 @@ def render_header():
 @st.cache_resource
 def get_client_and_pid():
     try:
-        cfg = build_config_from_streamlit_secrets(st.secrets)
-    except GA4ConfigError as e:
+        cfg = ga.build_config_from_streamlit_secrets(st.secrets)
+    except ga.GA4ConfigError as e:
         fail_ui(str(e))
-    client = make_client(cfg)
+    client = ga.make_client(cfg)
     return client, cfg.property_id
 
 
@@ -121,6 +118,7 @@ with st.sidebar:
 # ----------------------------
 tab1, tab2, tab3 = st.tabs(["URL Analytics", "Топ материалов", "Общие данные по сайту"])
 
+
 # ----------------------------
 # Tab 1: URL Analytics
 # ----------------------------
@@ -137,9 +135,9 @@ with tab1:
         if not lines:
             fail_ui("Добавьте хотя бы один URL/путь.")
 
-        unique_paths, hostnames, order_paths = collect_paths_hosts(lines)
+        unique_paths, hostnames, order_paths = ga.collect_paths_hosts(lines)
 
-        df = fetch_ga4_by_paths(
+        df = ga.fetch_ga4_by_paths(
             client=client,
             property_id=property_id,
             paths_in=unique_paths,
@@ -149,7 +147,6 @@ with tab1:
             order_keys=order_paths,
         )
 
-        # Порядок и русские названия как ты просил
         show = df.reindex(
             columns=[
                 "pagePath",
@@ -178,6 +175,7 @@ with tab1:
             mime="text/csv",
         )
 
+
 # ----------------------------
 # Tab 2: Top materials
 # ----------------------------
@@ -191,7 +189,7 @@ with tab2:
         if not property_id:
             fail_ui("GA4 Property ID пуст.")
 
-        df_top = fetch_top_materials(
+        df_top = ga.fetch_top_materials(
             client=client,
             property_id=property_id,
             start_date=str(date_from),
@@ -227,6 +225,7 @@ with tab2:
             mime="text/csv",
         )
 
+
 # ----------------------------
 # Tab 3: Site totals
 # ----------------------------
@@ -239,15 +238,13 @@ with tab3:
         if not property_id:
             fail_ui("GA4 Property ID пуст.")
 
-        totals = fetch_site_totals(
+        totals = ga.fetch_site_totals(
             client=client,
             property_id=property_id,
             start_date=str(date_from),
             end_date=str(date_to),
         )
 
-        # Порядок слева направо как ты просил:
-        # Views (Page Views), Sessions, totalUsers (Unique Users), activeUsers (Active users)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Page Views", f"{int(totals.get('views', 0)):,}")
         c2.metric("Sessions", f"{int(totals.get('sessions', 0)):,}")

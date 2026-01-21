@@ -1,10 +1,9 @@
-# streamlit_app.py
 import streamlit as st
 import pandas as pd
 from datetime import date, timedelta
 
 from ga4_lib import (
-    build_config_from_streamlit_secrets,
+    build_config_from_secrets,
     make_client,
     collect_paths_hosts,
     fetch_ga4_by_paths,
@@ -15,18 +14,22 @@ from ga4_lib import (
 
 st.set_page_config(page_title="Analytics Console", layout="wide")
 
+
 def fail_ui(msg: str):
     st.error(msg)
     st.stop()
 
+
 @st.cache_resource
 def get_client_and_pid():
     try:
-        cfg = build_config_from_streamlit_secrets(st.secrets)
+        cfg = build_config_from_secrets(st.secrets)
     except GA4ConfigError as e:
         fail_ui(str(e))
+
     client = make_client(cfg)
     return client, cfg.property_id
+
 
 client, pid_default = get_client_and_pid()
 
@@ -43,6 +46,7 @@ with st.sidebar:
 
 tab1, tab2, tab3 = st.tabs(["URL Analytics", "Топ материалов", "Общие данные по сайту"])
 
+# ---------------- Tab 1 ----------------
 with tab1:
     st.subheader("URL Analytics")
     uinput = st.text_area("Вставьте URL или пути (по одному в строке)", height=200)
@@ -68,17 +72,25 @@ with tab1:
             order_keys=order_paths,
         )
 
-        show = df_p.reindex(columns=[
-            "pagePath","pageTitle","screenPageViews","activeUsers",
-            "viewsPerActiveUser","avgEngagementTime_sec"
-        ]).rename(columns={
-            "pagePath":"Путь",
-            "pageTitle":"Заголовок",
-            "screenPageViews":"Просмотры",
-            "activeUsers":"Уникальные пользователи",
-            "viewsPerActiveUser":"Просмотры / пользователь",
-            "avgEngagementTime_sec":"Average engagement time (сек)",
-        })
+        show = df_p.reindex(
+            columns=[
+                "pagePath",
+                "pageTitle",
+                "screenPageViews",
+                "activeUsers",
+                "viewsPerActiveUser",
+                "avgEngagementTime_sec",
+            ]
+        ).rename(
+            columns={
+                "pagePath": "Путь",
+                "pageTitle": "Заголовок",
+                "screenPageViews": "Просмотры",
+                "activeUsers": "Уникальные пользователи",
+                "viewsPerActiveUser": "Просмотры / пользователь",
+                "avgEngagementTime_sec": "Average engagement time (сек)",
+            }
+        )
 
         st.dataframe(show, use_container_width=True, hide_index=True)
         st.download_button(
@@ -88,6 +100,7 @@ with tab1:
             "text/csv",
         )
 
+# ---------------- Tab 2 ----------------
 with tab2:
     st.subheader("Топ материалов")
     limit = st.number_input("Лимит", min_value=1, max_value=500, value=10)
@@ -107,6 +120,7 @@ with tab2:
         )
         st.dataframe(df_top, use_container_width=True, hide_index=True)
 
+# ---------------- Tab 3 ----------------
 with tab3:
     st.subheader("Общие данные по сайту")
 
@@ -122,7 +136,13 @@ with tab3:
             start_date=str(date_from),
             end_date=str(date_to),
         )
+
+        # totals is a 1-row DataFrame
+        s = int(totals.loc[0, "sessions"]) if not totals.empty else 0
+        u = int(totals.loc[0, "totalUsers"]) if not totals.empty else 0
+        v = int(totals.loc[0, "screenPageViews"]) if not totals.empty else 0
+
         c1, c2, c3 = st.columns(3)
-        c1.metric("Sessions", f"{totals['sessions']:,}")
-        c2.metric("Unique Users", f"{totals['totalUsers']:,}")
-        c3.metric("Page Views", f"{totals['screenPageViews']:,}")
+        c1.metric("Sessions", f"{s:,}")
+        c2.metric("Unique Users", f"{u:,}")
+        c3.metric("Page Views", f"{v:,}")

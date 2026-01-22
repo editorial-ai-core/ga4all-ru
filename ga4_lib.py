@@ -1,7 +1,3 @@
-# ga4_lib.py
-# GA4 helper library for Streamlit apps (Service Account + GA4 Data API)
-# ВАЖНО: без InListFilter (в некоторых версиях google-analytics-data его нет)
-
 import pandas as pd
 from urllib.parse import urlparse
 
@@ -273,4 +269,68 @@ def fetch_ga4_by_paths(client, property_id, paths_in, hosts_in, start_date, end_
     return out.reindex(columns=keep)
 
 
-def fetch_top_materials(client, property_id, start_date, end_date, limit=10
+def fetch_top_materials(client, property_id, start_date, end_date, limit=10):
+    """
+    Топ материалов по Views (screenPageViews) с теми же метриками.
+    """
+    dims = ["pagePath", "pageTitle"]
+    mets = ["screenPageViews", "activeUsers", "sessions", "engagementRate", "userEngagementDuration"]
+
+    order_bys = [OrderBy(metric=OrderBy.MetricOrderBy(metric_name="screenPageViews"), desc=True)]
+
+    df = _run_report(
+        client=client,
+        property_id=property_id,
+        start_date=start_date,
+        end_date=end_date,
+        dimensions=dims,
+        metrics=mets,
+        dimension_filter=None,
+        limit=int(limit),
+        order_bys=order_bys,
+    )
+
+    df["avgEngagementTime_sec"] = (df["userEngagementDuration"] / df["sessions"]).fillna(0)
+
+    keep = ["pagePath", "pageTitle", "screenPageViews", "activeUsers", "sessions", "engagementRate", "avgEngagementTime_sec"]
+    return df.reindex(columns=keep)
+
+
+def fetch_site_totals(client, property_id, start_date, end_date):
+    """
+    Итоги для вкладки "Общие данные по сайту":
+      Views (Page Views) -> screenPageViews
+      Sessions          -> sessions
+      Unique Users      -> totalUsers
+      Active users      -> activeUsers
+    """
+    df = _run_report(
+        client=client,
+        property_id=property_id,
+        start_date=start_date,
+        end_date=end_date,
+        dimensions=[],
+        metrics=["screenPageViews", "sessions", "totalUsers", "activeUsers"],
+        dimension_filter=None,
+        limit=1,
+    )
+
+    if df.empty:
+        return {"screenPageViews": 0, "sessions": 0, "totalUsers": 0, "activeUsers": 0}
+
+    row = df.iloc[0].to_dict()
+    return {
+        "screenPageViews": float(row.get("screenPageViews") or 0),
+        "sessions": float(row.get("sessions") or 0),
+        "totalUsers": float(row.get("totalUsers") or 0),
+        "activeUsers": float(row.get("activeUsers") or 0),
+    }
+
+
+RUS_METRIC_LABELS = {
+    "screenPageViews": "Просмотры",
+    "activeUsers": "Активные пользователи",
+    "sessions": "Сессии",
+    "engagementRate": "Доля вовлечённых сессий",
+    "avgEngagementTime_sec": "Средняя длительность сеанса",
+}

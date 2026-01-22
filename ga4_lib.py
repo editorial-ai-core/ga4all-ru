@@ -1,14 +1,11 @@
 # ga4_lib.py
 # GA4 helper library for Streamlit apps (Service Account + GA4 Data API)
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+# максимально совместимая версия (без dataclass/typing/__future__)
 
 import pandas as pd
+from urllib.parse import urlparse
 
+from google.oauth2 import service_account
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     DateRange,
@@ -20,119 +17,81 @@ from google.analytics.data_v1beta.types import (
     OrderBy,
     RunReportRequest,
 )
-from google.oauth2 import service_account
 
-
-# ---------------------------
-# Errors / Config
-# ---------------------------
 
 class GA4ConfigError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class GA4Config:
-    property_id: str
-    service_account_info: Dict[str, Any]
-    scopes: Tuple[str, ...] = ("https://www.googleapis.com/auth/analytics.readonly",)
-
-
-def _require_key(d: Any, key: str, expected_type: type, hint: str = "") -> Any:
-    if not isinstance(d, dict) or key not in d:
-        raise GA4ConfigError(f"Missing secret: {key} ({expected_type.__name__})")
-    v = d.get(key)
-    if not isinstance(v, expected_type):
-        raise GA4ConfigError(f"Bad secret type: {key} must be {expected_type.__name__}")
-    if hint:
-        # hint is not shown by default, only useful during debugging
-        pass
-    return v
-
-
-def build_config_from_streamlit_secrets(secrets: Any) -> GA4Config:
+def build_config_from_streamlit_secrets(secrets):
     """
-    Expected Streamlit secrets keys:
+    Ожидается в Streamlit Secrets:
 
-    GA4_PROPERTY_ID = "123456789"
+    GA4_PROPERTY_ID = "318772986"
+
     [gcp_service_account]
-    type="service_account"
-    project_id="..."
-    private_key_id="..."
-    private_key="""-----BEGIN PRIVATE KEY-----
+    type = "service_account"
+    project_id = "..."
+    private_key_id = "..."
+    private_key = '''-----BEGIN PRIVATE KEY-----
     ...
-    -----END PRIVATE KEY-----"""
-    client_email="..."
-    token_uri="https://oauth2.googleapis.com/token"
-
-    Notes:
-    - st.secrets behaves like a dict-like object. We only rely on dict operations.
-    - private_key can be multi-line (preferred) OR contain \n escapes.
+    -----END PRIVATE KEY-----'''
+    client_email = "..."
+    token_uri = "https://oauth2.googleapis.com/token"
     """
-    # secrets may be a special Streamlit object; convert shallowly via dict()
+    # st.secrets иногда не совсем dict — пробуем привести
     try:
         root = dict(secrets)
     except Exception:
-        # last resort: assume it's already dict-like
-        root = secrets  # type: ignore
+        root = secrets
 
-    # property id
     prop = root.get("GA4_PROPERTY_ID") or root.get("ga4_property_id") or root.get("property_id")
     if not prop or not isinstance(prop, str):
         raise GA4ConfigError("Missing secret: GA4_PROPERTY_ID (str)")
     prop = prop.strip()
 
-    # service account dict
     sa = root.get("gcp_service_account")
     if sa is None:
         raise GA4ConfigError("Missing secret: gcp_service_account (dict)")
     if not isinstance(sa, dict):
-        # sometimes Streamlit keeps nested objects; try converting
         try:
             sa = dict(sa)
         except Exception:
             raise GA4ConfigError("Bad secret type: gcp_service_account must be dict")
 
-    # normalize private_key (allow either real multiline or \n escapes)
+    # нормализуем private_key: если вставлен как \n — превращаем в реальные переводы строк
     pk = sa.get("private_key")
-    if isinstance(pk, str):
-        # If user pasted with "\n" escapes, convert to real newlines
-        if "\\n" in pk and "-----BEGIN PRIVATE KEY-----" in pk:
-            sa["private_key"] = pk.replace("\\n", "\n")
+    if not isinstance(pk, str) or not pk.strip():
+        raise GA4ConfigError("Missing secret inside [gcp_service_account]: private_key (str)")
+    if "\\n" in pk and "-----BEGIN PRIVATE KEY-----" in pk:
+        sa["private_key"] = pk.replace("\\n", "\n")
 
-    # minimal fields validation (don't be too strict)
+    # минимальная валидация обязательных строковых полей
     for k in ("type", "client_email", "token_uri", "private_key"):
-        if k not in sa or not isinstance(sa.get(k), str) or not str(sa.get(k)).strip():
-            raise GA4ConfigError(f"Missing secret inside [gcp_service_account]: {k} (str)")
+        v = sa.get(k)
+        if not isinstance(v, str) or not v.strip():
+            raise GA4ConfigError("Missing secret inside [gcp_service_account]: %s (str)" % k)
 
-    return GA4Config(property_id=prop, service_account_info=sa)
+    return {"property_id": prop, "service_account_info": sa}
 
 
-# ---------------------------
-# Client
-# ---------------------------
-
-def make_client(cfg: GA4Config) -> BetaAnalyticsDataClient:
+def make_client(cfg):
+    scopes = ["https://www.googleapis.com/auth/analytics.readonly"]
     creds = service_account.Credentials.from_service_account_info(
-        cfg.service_account_info,
-        scopes=list(cfg.scopes),
+        cfg["service_account_info"],
+        scopes=scopes,
     )
     return BetaAnalyticsDataClient(credentials=creds)
 
 
-# ---------------------------
-# URL parsing helpers
-# ---------------------------
-
-def collect_paths_hosts(lines: Sequence[str]) -> Tuple[List[str], List[str], List[str]]:
+def collect_paths_hosts(lines):
     """
-    Takes list of strings (URLs or paths), returns:
-      unique_paths: unique pagePath values for filtering
-      hostnames: unique hostName values (if URLs were provided)
-      order_paths: original order (normalized paths) to restore output ordering
+    Вход: список строк (URL или пути)
+    Выход:
+      unique_paths, hostnames, order_paths
     """
-    paths: List[str] = []
-    hosts: List[str] = []
+    paths = []
+    hosts = []
 
     for raw in lines:
         s = (raw or "").strip()
@@ -148,32 +107,25 @@ def collect_paths_hosts(lines: Sequence[str]) -> Tuple[List[str], List[str], Lis
                 p = "/" + p
             paths.append(p)
         else:
-            # treat as path
             p2 = s
             if not p2.startswith("/"):
                 p2 = "/" + p2
             paths.append(p2)
 
-    # unique while preserving order
-    def uniq(seq: List[str]) -> List[str]:
+    def uniq(seq):
         seen = set()
-        out: List[str] = []
+        out = []
         for x in seq:
             if x not in seen:
                 seen.add(x)
                 out.append(x)
         return out
 
-    order_paths = paths[:]  # keep original ordering
-    return uniq(paths), uniq(hosts), order_paths
+    return uniq(paths), uniq(hosts), list(paths)
 
 
-# ---------------------------
-# GA4 Data API helpers
-# ---------------------------
-
-def _chunks(seq: Sequence[str], size: int) -> Iterable[List[str]]:
-    buf: List[str] = []
+def _chunks(seq, size):
+    buf = []
     for x in seq:
         buf.append(x)
         if len(buf) >= size:
@@ -183,7 +135,7 @@ def _chunks(seq: Sequence[str], size: int) -> Iterable[List[str]]:
         yield buf
 
 
-def _inlist_expr(field_name: str, values: Sequence[str]) -> FilterExpression:
+def _inlist_expr(field_name, values):
     return FilterExpression(
         filter=Filter(
             field_name=field_name,
@@ -192,7 +144,7 @@ def _inlist_expr(field_name: str, values: Sequence[str]) -> FilterExpression:
     )
 
 
-def _and_expr(parts: List[FilterExpression]) -> Optional[FilterExpression]:
+def _and_expr(parts):
     parts2 = [p for p in parts if p is not None]
     if not parts2:
         return None
@@ -201,23 +153,13 @@ def _and_expr(parts: List[FilterExpression]) -> Optional[FilterExpression]:
     return FilterExpression(and_group=FilterExpression.ListExpression(expressions=parts2))
 
 
-def _run_report(
-    client: BetaAnalyticsDataClient,
-    property_id: str,
-    start_date: str,
-    end_date: str,
-    dimensions: List[str],
-    metrics: List[str],
-    dimension_filter: Optional[FilterExpression] = None,
-    limit: int = 100000,
-    order_bys: Optional[List[OrderBy]] = None,
-) -> pd.DataFrame:
+def _run_report(client, property_id, start_date, end_date, dimensions, metrics, dimension_filter=None, limit=100000, order_bys=None):
     req = RunReportRequest(
         property="properties/%s" % property_id,
         date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
         dimensions=[Dimension(name=d) for d in dimensions],
         metrics=[Metric(name=m) for m in metrics],
-        limit=limit,
+        limit=int(limit),
     )
     if dimension_filter is not None:
         req.dimension_filter = dimension_filter
@@ -227,7 +169,7 @@ def _run_report(
     resp = client.run_report(req)
 
     cols = list(dimensions) + list(metrics)
-    rows: List[List[Any]] = []
+    rows = []
 
     for r in resp.rows:
         dvals = [dv.value for dv in r.dimension_values]
@@ -236,7 +178,6 @@ def _run_report(
 
     df = pd.DataFrame(rows, columns=cols)
 
-    # coerce numeric metrics
     for m in metrics:
         if m in df.columns:
             df[m] = pd.to_numeric(df[m], errors="coerce")
@@ -244,41 +185,25 @@ def _run_report(
     return df
 
 
-# ---------------------------
-# Public API
-# ---------------------------
-
-def fetch_ga4_by_paths(
-    client: BetaAnalyticsDataClient,
-    property_id: str,
-    paths_in: Sequence[str],
-    hosts_in: Sequence[str],
-    start_date: str,
-    end_date: str,
-    order_keys: Optional[Sequence[str]] = None,
-) -> pd.DataFrame:
+def fetch_ga4_by_paths(client, property_id, paths_in, hosts_in, start_date, end_date, order_keys=None):
     """
-    Returns per-page table for given paths (+ optional hostName filter).
-    Metrics:
-      - screenPageViews  (Views)
-      - activeUsers      (Active users)
-      - sessions         (Sessions)
-      - engagementRate   (Engaged sessions / Sessions)
-      - userEngagementDuration (seconds) -> to compute engagementTime/sessions
+    Таблица по конкретным путям.
+    Метрики (как ты просил):
+      Views         -> screenPageViews
+      Active users  -> activeUsers
+      Sessions      -> sessions
+      engagementRate -> engagementRate
+      engagementTime/sessions -> userEngagementDuration / sessions (сек)
     """
-
     dims = ["pagePath", "pageTitle"]
     mets = ["screenPageViews", "activeUsers", "sessions", "engagementRate", "userEngagementDuration"]
 
-    # GA4 InListFilter has practical limits; chunk paths
-    all_frames: List[pd.DataFrame] = []
+    all_frames = []
 
-    # host filter (if provided)
-    host_expr: Optional[FilterExpression] = None
+    host_expr = None
     if hosts_in:
         host_expr = _inlist_expr("hostName", list(hosts_in))
 
-    # IMPORTANT: use pagePath filter; if you need query string, switch to pagePathPlusQueryString
     for part in _chunks(list(paths_in), 100):
         path_expr = _inlist_expr("pagePath", part)
         filt = _and_expr([path_expr, host_expr] if host_expr is not None else [path_expr])
@@ -299,45 +224,37 @@ def fetch_ga4_by_paths(
         out = pd.DataFrame(columns=dims + mets)
     else:
         out = pd.concat(all_frames, ignore_index=True)
-        # aggregate duplicates across chunks (same path/title)
-        grp = out.groupby(["pagePath", "pageTitle"], as_index=False)[mets].sum(numeric_only=True)
-        out = grp
+        # если один и тот же путь пришёл из разных чанков — суммируем
+        out = out.groupby(["pagePath", "pageTitle"], as_index=False)[mets].sum(numeric_only=True)
 
-    # compute engagementTime/sessions (Average engagement time per session, seconds)
-    out["avgEngagementTime_sec"] = (out["userEngagementDuration"] / out["sessions"]).replace([pd.NA, pd.NaT], 0)
-    out["avgEngagementTime_sec"] = out["avgEngagementTime_sec"].fillna(0)
+    # engagementTime/sessions
+    out["avgEngagementTime_sec"] = (out["userEngagementDuration"] / out["sessions"]).fillna(0)
 
-    # optional: restore ordering by order_keys (paths)
+    # сортировка
     if order_keys:
-        order_index = {p: i for i, p in enumerate(list(order_keys))}
-        out["_ord"] = out["pagePath"].map(lambda x: order_index.get(x, 10**9))
+        idx = {}
+        i = 0
+        for p in list(order_keys):
+            if p not in idx:
+                idx[p] = i
+                i += 1
+        out["_ord"] = out["pagePath"].map(lambda x: idx.get(x, 10**9))
         out = out.sort_values(["_ord", "screenPageViews"], ascending=[True, False]).drop(columns=["_ord"])
     else:
         out = out.sort_values("screenPageViews", ascending=False)
 
-    # keep only columns we care about
     keep = ["pagePath", "pageTitle", "screenPageViews", "activeUsers", "sessions", "engagementRate", "avgEngagementTime_sec"]
-    out = out.reindex(columns=keep)
-
-    return out
+    return out.reindex(columns=keep)
 
 
-def fetch_top_materials(
-    client: BetaAnalyticsDataClient,
-    property_id: str,
-    start_date: str,
-    end_date: str,
-    limit: int = 10,
-) -> pd.DataFrame:
+def fetch_top_materials(client, property_id, start_date, end_date, limit=10):
     """
-    Top pages by Views with required metrics.
+    Топ материалов по Views (screenPageViews) с теми же метриками.
     """
     dims = ["pagePath", "pageTitle"]
     mets = ["screenPageViews", "activeUsers", "sessions", "engagementRate", "userEngagementDuration"]
 
-    order_bys = [
-        OrderBy(metric=OrderBy.MetricOrderBy(metric_name="screenPageViews"), desc=True)
-    ]
+    order_bys = [OrderBy(metric=OrderBy.MetricOrderBy(metric_name="screenPageViews"), desc=True)]
 
     df = _run_report(
         client=client,
@@ -356,19 +273,14 @@ def fetch_top_materials(
     return df.reindex(columns=keep)
 
 
-def fetch_site_totals(
-    client: BetaAnalyticsDataClient,
-    property_id: str,
-    start_date: str,
-    end_date: str,
-) -> Dict[str, float]:
+def fetch_site_totals(client, property_id, start_date, end_date):
     """
-    Site totals for the period.
-    You said you need (left->right):
-      Views (Page Views) = screenPageViews
-      Sessions           = sessions
-      totalUsers         = totalUsers (Unique Users)
-      activeUsers        = activeUsers
+    Итоги для вкладки "Общие данные по сайту":
+    в коде ты хочешь выводить слева направо:
+      Views (Page Views) -> screenPageViews
+      Sessions          -> sessions
+      Unique Users      -> totalUsers
+      Active users      -> activeUsers
     """
     df = _run_report(
         client=client,
@@ -385,20 +297,15 @@ def fetch_site_totals(
         return {"screenPageViews": 0, "sessions": 0, "totalUsers": 0, "activeUsers": 0}
 
     row = df.iloc[0].to_dict()
-    # ensure keys exist
-    out = {
+    return {
         "screenPageViews": float(row.get("screenPageViews") or 0),
         "sessions": float(row.get("sessions") or 0),
         "totalUsers": float(row.get("totalUsers") or 0),
         "activeUsers": float(row.get("activeUsers") or 0),
     }
-    return out
 
 
-# ---------------------------
-# Optional: UI-friendly Russian column mapping
-# ---------------------------
-
+# Для удобства (если захочешь в streamlit_app.py делать rename)
 RUS_METRIC_LABELS = {
     "screenPageViews": "Просмотры",
     "activeUsers": "Активные пользователи",
@@ -406,4 +313,3 @@ RUS_METRIC_LABELS = {
     "engagementRate": "Доля вовлечённых сессий",
     "avgEngagementTime_sec": "Средняя длительность сеанса",
 }
-
